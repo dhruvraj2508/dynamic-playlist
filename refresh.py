@@ -19,6 +19,59 @@ REFRESH_TOKEN = os.environ["SPOTIFY_REFRESH_TOKEN"]
 # ---------- Helpers ----------
 ID_RE = re.compile(r"^[0-9A-Za-z]{22}$")
 
+def get_recent_track_ids(sp: Spotify, limit=50):
+    try:
+        res = sp.current_user_recently_played(limit=limit)
+        items = res.get("items", [])
+        return [it["track"]["id"] for it in items if it.get("track") and it["track"].get("id")]
+    except Exception:
+        return []
+
+def get_saved_track_ids(sp: Spotify, max_items=200):
+    got, ids = 0, []
+    try:
+        while got < max_items:
+            page = sp.current_user_saved_tracks(limit=50, offset=got)
+            items = page.get("items", [])
+            if not items:
+                break
+            ids.extend([it["track"]["id"] for it in items if it.get("track") and it["track"].get("id")])
+            got += len(items)
+            if not page.get("next"):
+                break
+    except Exception:
+        pass
+    return ids
+
+def related_artist_pool(sp: Spotify, market: str, seed_artists=8, related_per_seed=6, top_per_related=5):
+    """Novelty: use *related* artists to your top artists, then their top tracks."""
+    pool = []
+    top_arts = (sp.current_user_top_artists(limit=seed_artists, time_range="short_term").get("items", [])
+                + sp.current_user_top_artists(limit=seed_artists, time_range="medium_term").get("items", []))
+    seen_related = set()
+    for a in top_arts[:seed_artists]:
+        aid = a.get("id")
+        if not aid: 
+            continue
+        try:
+            rel = sp.artist_related_artists(aid).get("artists", [])[:related_per_seed]
+            for r in rel:
+                ra_id = r.get("id")
+                if not ra_id or ra_id in seen_related:
+                    continue
+                seen_related.add(ra_id)
+                tt = sp.artist_top_tracks(ra_id, country=market).get("tracks", [])[:top_per_related]
+                pool.extend([t.get("id") for t in tt if t and t.get("id")])
+        except Exception:
+            continue
+    # dedupe
+    seen=set(); out=[]
+    for x in pool:
+        if x and x not in seen:
+            seen.add(x); out.append(x)
+    return out
+
+
 def now_ist():
     return dt.datetime.now(IST)
 
@@ -107,63 +160,58 @@ def safe_call(fn, *args, **kwargs):
 
 # ---------- Discovery building without Recommendations ----------
 def audio_filter(sp: Spotify, ids: List[str], tempo_range, energy_range) -> List[str]:
-    """Filter tracks by audio features with size/backoff; if Spotify forbids, return unfiltered fallback."""
+    """Filter tracks by audio features with cautious batching; on repeated 403s, fall back silently."""
     if not ids:
         return []
     out: List[str] = []
 
-    def fetch_features(batch: List[str]) -> List[dict]:
-        # try progressively smaller batches on 403 / 429
-        for size in (len(batch), 50, 25, 10, 5, 1):
+    def fetch_features_safely(batch: List[str]) -> List[tuple]:
+        # progressively smaller chunks; never log, just downshift/skip
+        chunk_sizes = [25, 10, 5, 1]
+        for size in chunk_sizes:
+            ok = True
             for i in range(0, len(batch), size):
                 sub = batch[i:i+size]
-                # small jitter sleep to be nice to API
-                time.sleep(0.15)
+                time.sleep(0.12)
                 try:
-                    feats = safe_call(sp.audio_features, sub)
+                    feats = sp.audio_features(sub)
                 except SpotifyException as e:
-                    # 403/429 → backoff to next smaller size
-                    if e.http_status in (403, 429):
-                        time.sleep(0.6)
-                        raise  # let outer loop try smaller size
-                    raise
+                    # 403/429: try smaller chunk
+                    ok = False
+                    break
+                except Exception:
+                    ok = False
+                    break
                 else:
                     for tr_id, f in zip(sub, feats):
-                        yield tr_id, f
-            # if we got here without raising, stop trying smaller sizes
-            return
+                        yield (tr_id, f)
+            if ok:
+                return
         return
 
     try:
-        # hard cap so we don't over-hit the endpoint
-        capped = ids[:200]
-        # start with moderate batches (50), inner backoff handles smaller
-        for batch_start in range(0, len(capped), 50):
-            batch = capped[batch_start:batch_start+50]
-            # fetch_features will internally downshift if needed
-            try:
-                for tr_id, f in fetch_features(batch) or []:
-                    if not f:
-                        continue
-                    tempo = f.get("tempo")
-                    energy = f.get("energy")
-                    if tempo is None or energy is None:
-                        continue
-                    if tempo_range[0] <= tempo <= tempo_range[1] and energy_range[0] <= energy <= energy_range[1]:
-                        out.append(tr_id)
-            except SpotifyException:
-                # if even tiny batches fail for this slice, skip filtering for this chunk
-                out.extend(batch)
-    except SpotifyException:
-        # global fallback: if audio-features keeps failing, return first 100 unfiltered
-        return ids[:100]
+        capped = ids[:160]  # keep API load modest
+        for i in range(0, len(capped), 25):
+            batch = capped[i:i+25]
+            for tr_id, f in fetch_features_safely(batch) or []:
+                if not f:
+                    continue
+                tempo = f.get("tempo"); energy = f.get("energy")
+                if tempo is None or energy is None:
+                    continue
+                if tempo_range[0] <= tempo <= tempo_range[1] and energy_range[0] <= energy <= energy_range[1]:
+                    out.append(tr_id)
+    except Exception:
+        # total fallback: if audio features keep failing, just return a trimmed list unfiltered
+        return ids[:80]
 
-    # dedupe
+    # dedupe preserve order
     seen=set(); keep=[]
     for t in out:
         if t not in seen:
             seen.add(t); keep.append(t)
     return keep
+
 
 
 def top_artist_tracks_pool(sp: Spotify, market: str, max_artists=10) -> List[str]:
@@ -200,23 +248,25 @@ def genre_search_pool(sp: Spotify, market: str, per_query=12) -> List[str]:
 
 
 def build_discovery(sp: Spotify, prof, market: str, avoid_ids: set) -> List[str]:
-    """
-    Build discovery without using /recommendations:
-      - top artists' top tracks
-      - keyword search pools
-      - filter by audio features
-    """
+    # Heard before (avoid): recently played + saved library + caller-provided avoid
+    recent = set(get_recent_track_ids(sp, limit=50))
+    saved  = set(get_saved_track_ids(sp, max_items=200))
+    avoid  = set(avoid_ids) | recent | saved
+
+    # Candidate pools:
     pool = []
-    pool.extend(top_artist_tracks_pool(sp, market, max_artists=12))
-    pool.extend(genre_search_pool(sp, market, per_query=30))
+    # novel-but-relevant: related artists of your top artists
+    pool.extend(related_artist_pool(sp, market, seed_artists=8, related_per_seed=6, top_per_related=5))
+    # broad search to keep variety / new releases
+    pool.extend(genre_search_pool(sp, market, per_query=12))
 
-    # Remove carried/familiar tracks
-    pool = [x for x in pool if x and x not in avoid_ids]
+    # remove heard + already chosen
+    pool = [x for x in pool if x and x not in avoid]
 
-    # Filter by tempo/energy to match the current window
+    # filter by audio features
     pool = audio_filter(sp, pool, tempo_range=prof["tempo"], energy_range=prof["energy"])
-
     return uniq(pool)
+
 
 # ---------- Main ----------
 def main():
