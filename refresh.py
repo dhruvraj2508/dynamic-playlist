@@ -27,6 +27,32 @@ def get_recent_track_ids(sp: Spotify, limit=50):
     except Exception:
         return []
 
+def recent_playlist_ids(sp: Spotify, playlist_id: str, hours=72):
+    """Tracks added to THIS playlist recently (avoid reusing them)."""
+    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=hours)
+    ids = []
+    results = sp.playlist_items(playlist_id, additional_types=("track",))
+    while True:
+        for it in results.get("items", []):
+            added_at = it.get("added_at")
+            if not added_at:
+                continue
+            try:
+                when = dt.datetime.fromisoformat(added_at.replace("Z", "+00:00"))
+            except ValueError:
+                continue
+            if when >= cutoff:
+                tr = it.get("track")
+                tid = tr and tr.get("id")
+                if tid:
+                    ids.append(tid)
+        if results.get("next"):
+            results = sp.next(results)
+        else:
+            break
+    return ids
+
+
 def get_saved_track_ids(sp: Spotify, max_items=200):
     got, ids = 0, []
     try:
@@ -79,13 +105,13 @@ def current_profile():
     """Time-of-day windows with tempo/energy ranges + familiar target."""
     h = now_ist().hour
     if 10 <= h < 13:     # 10–13 High-energy (work vibe)
-        return {"n_tracks": 50, "tempo": (105, 130), "energy": (0.65, 0.85), "familiar_ratio": 0.70}
+        return {"n_tracks": 50, "tempo": (105, 130), "energy": (0.65, 0.85), "familiar_ratio": 0.60}
     elif 13 <= h < 16:   # 13–16 Mellow
-        return {"n_tracks": 50, "tempo": (70, 95),   "energy": (0.30, 0.50), "familiar_ratio": 0.70}
+        return {"n_tracks": 50, "tempo": (70, 95),   "energy": (0.30, 0.50), "familiar_ratio": 0.60}
     elif 16 <= h < 20:   # 16–20 Focused high-energy
-        return {"n_tracks": 50, "tempo": (105, 132), "energy": (0.60, 0.80), "familiar_ratio": 0.70}
+        return {"n_tracks": 50, "tempo": (105, 132), "energy": (0.60, 0.80), "familiar_ratio": 0.60}
     else:                # Off-hours mellow
-        return {"n_tracks": 40, "tempo": (70, 95),   "energy": (0.30, 0.50), "familiar_ratio": 0.70}
+        return {"n_tracks": 40, "tempo": (70, 95),   "energy": (0.30, 0.50), "familiar_ratio": 0.60}
 
 class RefreshAuth(SpotifyOAuth):
     def __init__(self):
@@ -248,24 +274,25 @@ def genre_search_pool(sp: Spotify, market: str, per_query=12) -> List[str]:
 
 
 def build_discovery(sp: Spotify, prof, market: str, avoid_ids: set) -> List[str]:
-    # Heard before (avoid): recently played + saved library + caller-provided avoid
-    recent = set(get_recent_track_ids(sp, limit=50))
-    saved  = set(get_saved_track_ids(sp, max_items=200))
-    avoid  = set(avoid_ids) | recent | saved
+    # Heard before (avoid): carry/familiar + recently played + saved + recently added to THIS playlist
+    recent_played = set(get_recent_track_ids(sp, limit=50))
+    saved_lib     = set(get_saved_track_ids(sp, max_items=300))
+    recent_in_pl  = set(recent_playlist_ids(sp, PLAYLIST_ID, hours=96))  # avoid last 4 days
+
+    avoid = set(avoid_ids) | recent_played | saved_lib | recent_in_pl
 
     # Candidate pools:
     pool = []
-    # novel-but-relevant: related artists of your top artists
-    pool.extend(related_artist_pool(sp, market, seed_artists=8, related_per_seed=6, top_per_related=5))
-    # broad search to keep variety / new releases
-    pool.extend(genre_search_pool(sp, market, per_query=12))
+    pool.extend(related_artist_pool(sp, market, seed_artists=10, related_per_seed=8, top_per_related=5))
+    pool.extend(genre_search_pool(sp, market, per_query=12))  # small pulls → lower API pressure
 
-    # remove heard + already chosen
+    # Remove already-heard / already-used
     pool = [x for x in pool if x and x not in avoid]
 
-    # filter by audio features
+    # Filter by audio features (with cautious batching)
     pool = audio_filter(sp, pool, tempo_range=prof["tempo"], energy_range=prof["energy"])
     return uniq(pool)
+
 
 
 # ---------- Main ----------
@@ -296,11 +323,24 @@ def main():
     final_ids = uniq(carry + familiar_pick + discovery_ids)[:n_total]
     final_uris = [f"spotify:track:{tid}" for tid in final_ids]  # write URIs
 
-    # Replace items in the SAME playlist
-    safe_call(sp.playlist_replace_items, PLAYLIST_ID, final_uris)
+    # --- FORCE FRESH "DATE ADDED": remove then add in chunks ---
+existing_ids = read_playlist_track_ids(sp, PLAYLIST_ID)
+if existing_ids:
+    existing_uris = [f"spotify:track:{tid}" for tid in existing_ids]
+    # remove all occurrences (handles duplicates properly)
+    for chunk in chunked(existing_uris, 100):
+        try:
+            sp.playlist_remove_all_occurrences_of_items(PLAYLIST_ID, chunk)
+        except Exception:
+            pass  # if a chunk fails, continue removing others
 
-    print(f"OK: wrote {len(final_uris)} tracks to {PLAYLIST_ID} at {now_ist()}. Window={prof}")
-    return 0
+# add the new sequence
+for chunk in chunked(final_uris, 100):
+    sp.playlist_add_items(PLAYLIST_ID, chunk)
+
+print(f"OK: wrote {len(final_uris)} tracks to {PLAYLIST_ID} at {now_ist()}. Window={prof}")
+return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
