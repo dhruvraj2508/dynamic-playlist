@@ -2,22 +2,37 @@ name: Refresh Spotify Playlist
 
 on:
   schedule:
-    # --- Option A: every 5 minutes (testing) ---
+    # --- Option A: run every 5 minutes (testing) ---
     - cron: "*/5 * * * *"
-    # --- Option B: 10:00, 13:00, 16:00 IST (UTC is +5:30 => 04:30, 07:30, 10:30) ---
+    # --- Option B: 10:00, 13:00, 16:00 IST ---
+    # GitHub uses UTC; IST = UTC+5:30 → 04:30, 07:30, 10:30 UTC
     - cron: "30 4,7,10 * * *"
   workflow_dispatch:
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
+    # (Optional) prevent overlapping runs
+    concurrency:
+      group: refresh-playlist
+      cancel-in-progress: true
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-      - run: pip install spotipy pytz
-      - env:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install spotipy==2.23.0 pytz
+
+      - name: Run refresher
+        env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
@@ -25,5 +40,3 @@ jobs:
           COUNTRY_MARKET: ${{ secrets.COUNTRY_MARKET }}
           TIMEZONE: ${{ secrets.TIMEZONE }}
         run: python refresh.py
-
-
