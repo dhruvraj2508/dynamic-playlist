@@ -19,7 +19,7 @@ ENV VARS (override as needed):
   N_TRACKS                   (default 50)
   TEMPO_MIN, TEMPO_MAX       (default 105, 132)
   ENERGY_MIN, ENERGY_MAX     (default 0.65, 0.85)
-  FAMILIAR_RATIO             (default 0.70)
+  FAMILIAR_RATIO             (default 0.50)
   CARRY_FRACTION             (default 0.20)
   MAX_REPEAT_FRACTION        (default 0.10)  # novelty across runs
   SEEN_WINDOW_DAYS           (default 30)    # novelty window
@@ -56,7 +56,7 @@ TEMPO_MIN = float(os.getenv("TEMPO_MIN", "105"))
 TEMPO_MAX = float(os.getenv("TEMPO_MAX", "132"))
 ENERGY_MIN = float(os.getenv("ENERGY_MIN", "0.65"))
 ENERGY_MAX = float(os.getenv("ENERGY_MAX", "0.85"))
-FAMILIAR_RATIO = float(os.getenv("FAMILIAR_RATIO", "0.70"))
+FAMILIAR_RATIO = float(os.getenv("FAMILIAR_RATIO", "0.50"))
 CARRY_FRACTION = float(os.getenv("CARRY_FRACTION", "0.20"))
 MAX_REPEAT_FRACTION = float(os.getenv("MAX_REPEAT_FRACTION", "0.10"))
 
