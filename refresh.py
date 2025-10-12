@@ -393,7 +393,7 @@ def write_run_report(sp_app: Spotify,
                     f"{tid},\"{m['name'].replace('\"','')}\",\"{m['artists'].replace('\"','')}\","
                     f"{source.get(tid,'?')},{int(tid in history_ids)},{int(tid in prev_set)}\n"
                 )
-        print(f"REPORT: wrote {path}")
+        print("REPORT: wrote {path}")
     except Exception:
         pass
 
