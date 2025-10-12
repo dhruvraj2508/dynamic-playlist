@@ -230,7 +230,7 @@ def related_artist_pool(sp_user: Spotify, sp_app: Spotify, market: str,
         if not id_ok(aid):
             continue
         try:
-            rel = sp_app.artist_related_artists(aid).get("artists", [])[:related_per_seed]
+            rel = spotipy.Spotify(auth_manager=sp_app.auth_manager).artist_related_artists(aid).get("artists", [])[:related_per_seed]
         except Exception:
             continue
         for r in rel:
@@ -246,9 +246,6 @@ def related_artist_pool(sp_user: Spotify, sp_app: Spotify, market: str,
     return uniq(pool)
 
 def genre_search_pool(sp_app: Spotify, market: str, per_query=12) -> List[str]:
-    """
-    Lightweight keyword search to pull in fresh tracks; keep numbers modest to reduce rate limits.
-    """
     queries = [
         'genre:"bollywood" year:2023-2025',
         'genre:"edm" year:2023-2025',
@@ -270,16 +267,11 @@ def genre_search_pool(sp_app: Spotify, market: str, per_query=12) -> List[str]:
 # -------------- Audio Feature Filter --------------
 def audio_filter(sp_app: Spotify, ids: List[str], tempo_range: Tuple[float, float],
                  energy_range: Tuple[float, float]) -> List[str]:
-    """
-    Filter tracks by audio features with cautious batching and silent fallback.
-    """
     if not ids:
         return []
-
     out: List[str] = []
 
     def fetch_features_cautious(batch: List[str]):
-        # progressively smaller chunks; never blow up, just downshift/skip
         for size in (25, 10, 5, 1):
             ok = True
             i = 0
@@ -302,7 +294,7 @@ def audio_filter(sp_app: Spotify, ids: List[str], tempo_range: Tuple[float, floa
                 return
 
     try:
-        capped = ids[:160]  # keep API load modest
+        capped = ids[:160]
         for group in chunked(capped, 25):
             for tr_id, f in fetch_features_cautious(list(group)) or []:
                 tempo = f.get("tempo")
@@ -312,7 +304,6 @@ def audio_filter(sp_app: Spotify, ids: List[str], tempo_range: Tuple[float, floa
                 if tempo_range[0] <= tempo <= tempo_range[1] and energy_range[0] <= energy <= energy_range[1]:
                     out.append(tr_id)
     except Exception:
-        # fall back: return unfiltered subset if features keep failing
         return ids[:80]
 
     return uniq(out)
@@ -320,21 +311,15 @@ def audio_filter(sp_app: Spotify, ids: List[str], tempo_range: Tuple[float, floa
 # -------------- Discovery Orchestrator ------------
 def build_discovery(sp_user: Spotify, sp_app: Spotify, prof: Dict[str, Any],
                     market: str, avoid_ids: Set[str]) -> List[str]:
-    # avoid: caller-provided + recently played + saved + recently added to this playlist
     recent_played = set(get_recent_track_ids(sp_user, limit=50))
     saved_lib     = set(get_saved_track_ids(sp_user, max_items=300))
     recent_in_pl  = set(recent_playlist_ids(sp_user, PLAYLIST_ID, hours=96))
-
     avoid = set(avoid_ids) | recent_played | saved_lib | recent_in_pl
 
     pool: List[str] = []
     pool.extend(related_artist_pool(sp_user, sp_app, market, seed_artists=10, related_per_seed=8, top_per_related=5))
     pool.extend(genre_search_pool(sp_app, market, per_query=12))
-
-    # remove already-heard/used
     pool = [x for x in pool if x and x not in avoid]
-
-    # audio feature filter
     pool = audio_filter(sp_app, pool, tempo_range=prof["tempo"], energy_range=prof["energy"])
     return uniq(pool)
 
@@ -377,7 +362,6 @@ def write_run_report(sp_app: Spotify,
         ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         path = f"runs/{ts}.csv"
 
-        # source labeling
         source = {}
         for t in carry:           source[t] = "carry"
         for t in familiar_pick:   source.setdefault(t, "familiar")
@@ -389,11 +373,11 @@ def write_run_report(sp_app: Spotify,
             f.write("track_id,name,artists,source,was_in_history,was_in_prev_playlist\n")
             for tid in final_ids:
                 m = meta.get(tid, {"name": "", "artists": ""})
-                f.write(
-                    f"{tid},\"{m['name'].replace('\"','')}\",\"{m['artists'].replace('\"','')}\","
-                    f"{source.get(tid,'?')},{int(tid in history_ids)},{int(tid in prev_set)}\n"
-                )
-        print("REPORT: wrote {path}")
+                name = (m["name"] or "").replace('"', "")
+                arts = (m["artists"] or "").replace('"', "")
+                src = source.get(tid, "?")
+                f.write(f"{tid},\"{name}\",\"{arts}\",{src},{int(tid in history_ids)},{int(tid in prev_set)}\n")
+        print(f"REPORT: wrote {path}")
     except Exception:
         pass
 
@@ -454,22 +438,19 @@ def main():
     final_ids  = uniq(carry + familiar_pick + discovery_ids)[:n_total]
 
     # --- NOVELTY CHECK vs previous run ---
-    prev_ids = current  # what was in the playlist at start of run
+    prev_ids = current  # playlist at start of run
     if prev_ids:
         overlap = len(set(final_ids) & set(prev_ids))
         overlap_pct = overlap / max(1, len(final_ids))
         new_pct = 1.0 - overlap_pct
-        print(f"NOVELTY: {new_pct:.1%} new vs previous run "
-              f"({len(final_ids)-overlap}/{len(final_ids)} new).")
+        print(f"NOVELTY: {new_pct:.1%} new vs previous run ({len(final_ids)-overlap}/{len(final_ids)} new).")
 
         if new_pct < NOVELTY_MIN_DIFF:
-            # Fallback: push more discovery by draining familiar repeats & re-sampling discovery
             shortfall = int(math.ceil((NOVELTY_MIN_DIFF - new_pct) * len(final_ids)))
             print(f"NOVELTY fallback: need ~{shortfall} more new tracks; re-sampling…")
             avoid_more = set(history_ids) | set(prev_ids) | set(final_ids)
             extra_pool = build_discovery(sp_user, sp_app, prof, MARKET, avoid_ids=avoid_more)
             extra = [t for t in extra_pool if t not in avoid_more][:shortfall + 10]
-            # replace from end to keep earlier sequencing
             taken = 0
             for i in range(len(final_ids)-1, -1, -1):
                 if taken >= len(extra):
@@ -499,17 +480,20 @@ def main():
         sp_user.playlist_add_items(PLAYLIST_ID, chunk)
         time.sleep(0.10)
 
-    # persist run to history (for ≤10% repeats next time)
+    # persist run to history
     save_history(history, final_ids)
 
     # write run report CSV
     write_run_report(sp_app, final_ids, carry, familiar_pick, discovery_ids, history_ids, prev_ids)
 
-    print(
-        f"OK: wrote {len(final_uris)} tracks to {PLAYLIST_ID} at {now_ist()}."
-        f" Window={{'n_tracks': {n_total}, 'tempo': {prof['tempo']}, 'energy': {prof['energy']},"
-        f" 'familiar_ratio': {familiar_ratio}}}"
-    )
+    # ---- SAFE PRINT (no complex f-string expressions) ----
+    window = {
+        "n_tracks": len(final_uris),
+        "tempo": list(current_profile()["tempo"]),
+        "energy": list(current_profile()["energy"]),
+        "familiar_ratio": float(FAMILIAR_RATIO_OVR) if FAMILIAR_RATIO_OVR else current_profile()["familiar_ratio"],
+    }
+    print("OK:", "wrote", len(final_uris), "tracks to", PLAYLIST_ID, "at", now_ist(), ". Window=", json.dumps(window))
     return 0
 
 
