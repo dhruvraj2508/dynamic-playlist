@@ -25,3 +25,5 @@ jobs:
           COUNTRY_MARKET: ${{ secrets.COUNTRY_MARKET }}
           TIMEZONE: ${{ secrets.TIMEZONE }}
         run: python refresh.py
+        - run: pip install spotipy==2.23.0 pytz
+
