@@ -31,7 +31,7 @@ REFRESH_TOKEN  = os.environ["SPOTIFY_REFRESH_TOKEN"]
 
 # Novelty/testing knobs (env-driven; safe defaults)
 CARRY_OVER_PCT     = float(os.environ.get("CARRY_OVER_PCT", "0.0"))   # set 0.0 while testing
-FAMILIAR_RATIO_OVR = os.environ.get("FAMILIAR_RATIO", "")             # e.g. "0.5" to override profile
+FAMILIAR_RATIO_OVR = os.environ.get("FAMILIAR_RATIO", "0.5")             # e.g. "0.5" to override profile
 NOVEL_WINDOW_DAYS  = int(os.environ.get("NOVEL_WINDOW_DAYS", "21"))   # history lookback for repeats
 MAX_REPEAT_PCT     = float(os.environ.get("MAX_REPEAT_PCT", "0.10"))  # ≤10% repeats across runs
 NOVELTY_MIN_DIFF   = float(os.environ.get("NOVELTY_MIN_DIFF", "0.60"))# require ≥60% new vs last run
