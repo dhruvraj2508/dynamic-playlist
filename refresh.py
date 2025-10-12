@@ -111,6 +111,9 @@ def pick_seeds(sp: Spotify):
     return seed_art, seed_trk
 
 def recs(sp, prof, seed_art, seed_trk, limit):
+    if limit <= 0:
+        return []
+
     params = {
         "limit": min(100, max(1, limit)),
         "market": MARKET,
@@ -121,9 +124,10 @@ def recs(sp, prof, seed_art, seed_trk, limit):
         "target_tempo": round(sum(prof["tempo"])/2, 1),
         "target_energy": round(sum(prof["energy"])/2, 2),
         "min_popularity": 20,
-        # ← Use only genre seeds to avoid any URI/ID parsing issues
-        "seed_genres": "pop,edm,bollywood"
+        # IMPORTANT: pass a LIST, not a string
+        "seed_genres": ["pop", "edm", "bollywood"],
     }
+
     r = sp.recommendations(**params)
     return [t["id"] for t in r.get("tracks", []) if t and t.get("id")]
 
