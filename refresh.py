@@ -38,13 +38,13 @@ TEMPO_MIN        = float(ENV("TEMPO_MIN", "105"))
 TEMPO_MAX        = float(ENV("TEMPO_MAX", "132"))
 ENERGY_MIN       = float(ENV("ENERGY_MIN", "0.65"))
 ENERGY_MAX       = float(ENV("ENERGY_MAX", "0.85"))
-FAMILIAR_RATIO   = float(ENV("FAMILIAR_RATIO", "0.70"))
+FAMILIAR_RATIO   = float(ENV("FAMILIAR_RATIO", "0.30"))
 CARRY_FRACTION   = float(ENV("CARRY_FRACTION", "0.20"))
 
 # Novelty memory
 STATE_PATH       = ENV("STATE_PATH", "state/seen.json")
 SEEN_WINDOW_DAYS = int(ENV("SEEN_WINDOW_DAYS", "30"))
-MAX_REPEAT_FRAC  = float(ENV("MAX_REPEAT_FRACTION", "0.10"))
+MAX_REPEAT_FRAC  = float(ENV("MAX_REPEAT_FRACTION", "0.05"))
 
 # Safety caps
 MAX_WRITE_CHUNK  = 100
