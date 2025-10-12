@@ -107,22 +107,64 @@ def safe_call(fn, *args, **kwargs):
 
 # ---------- Discovery building without Recommendations ----------
 def audio_filter(sp: Spotify, ids: List[str], tempo_range, energy_range) -> List[str]:
-    """Filter tracks by audio features."""
+    """Filter tracks by audio features with size/backoff; if Spotify forbids, return unfiltered fallback."""
     if not ids:
         return []
-    out = []
-    for batch in chunked(ids, 100):
-        feats = safe_call(sp.audio_features, batch)
-        for tr_id, f in zip(batch, feats):
-            if not f:
-                continue
-            tempo = f.get("tempo")
-            energy = f.get("energy")
-            if tempo is None or energy is None:
-                continue
-            if tempo_range[0] <= tempo <= tempo_range[1] and energy_range[0] <= energy <= energy_range[1]:
-                out.append(tr_id)
-    return out
+    out: List[str] = []
+
+    def fetch_features(batch: List[str]) -> List[dict]:
+        # try progressively smaller batches on 403 / 429
+        for size in (len(batch), 50, 25, 10, 5, 1):
+            for i in range(0, len(batch), size):
+                sub = batch[i:i+size]
+                # small jitter sleep to be nice to API
+                time.sleep(0.15)
+                try:
+                    feats = safe_call(sp.audio_features, sub)
+                except SpotifyException as e:
+                    # 403/429 → backoff to next smaller size
+                    if e.http_status in (403, 429):
+                        time.sleep(0.6)
+                        raise  # let outer loop try smaller size
+                    raise
+                else:
+                    for tr_id, f in zip(sub, feats):
+                        yield tr_id, f
+            # if we got here without raising, stop trying smaller sizes
+            return
+        return
+
+    try:
+        # hard cap so we don't over-hit the endpoint
+        capped = ids[:200]
+        # start with moderate batches (50), inner backoff handles smaller
+        for batch_start in range(0, len(capped), 50):
+            batch = capped[batch_start:batch_start+50]
+            # fetch_features will internally downshift if needed
+            try:
+                for tr_id, f in fetch_features(batch) or []:
+                    if not f:
+                        continue
+                    tempo = f.get("tempo")
+                    energy = f.get("energy")
+                    if tempo is None or energy is None:
+                        continue
+                    if tempo_range[0] <= tempo <= tempo_range[1] and energy_range[0] <= energy <= energy_range[1]:
+                        out.append(tr_id)
+            except SpotifyException:
+                # if even tiny batches fail for this slice, skip filtering for this chunk
+                out.extend(batch)
+    except SpotifyException:
+        # global fallback: if audio-features keeps failing, return first 100 unfiltered
+        return ids[:100]
+
+    # dedupe
+    seen=set(); keep=[]
+    for t in out:
+        if t not in seen:
+            seen.add(t); keep.append(t)
+    return keep
+
 
 def top_artist_tracks_pool(sp: Spotify, market: str, max_artists=10) -> List[str]:
     """Collect candidates from user's top artists' top tracks."""
@@ -139,13 +181,8 @@ def top_artist_tracks_pool(sp: Spotify, market: str, max_artists=10) -> List[str
             continue
     return uniq(pool)
 
-def genre_search_pool(sp: Spotify, market: str, per_query=25) -> List[str]:
-    """
-    Use Search API to gather new tracks by keywords (EDM/pop/indie/hip-hop + Indian cues).
-    We avoid 'genre:' operator issues by using free-text queries that work broadly.
-    """
+def genre_search_pool(sp: Spotify, market: str, per_query=12) -> List[str]:
     queries = [
-        # high-energy & Indian cues included
         "edm 2023..2025", "dance 2023..2025", "club 2023..2025",
         "pop 2023..2025", "indie 2022..2025", "hip hop 2022..2025",
         "hindi pop 2022..2025", "punjabi 2022..2025", "desi pop 2022..2025",
@@ -156,9 +193,11 @@ def genre_search_pool(sp: Spotify, market: str, per_query=25) -> List[str]:
             res = safe_call(sp.search, q=q, type="track", limit=per_query, market=market)
             items = (res.get("tracks") or {}).get("items", [])
             pool.extend([t.get("id") for t in items if t and t.get("id")])
+            time.sleep(0.15)  # tiny pause to be polite
         except Exception:
             continue
     return uniq(pool)
+
 
 def build_discovery(sp: Spotify, prof, market: str, avoid_ids: set) -> List[str]:
     """
