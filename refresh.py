@@ -8,6 +8,7 @@ from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.exceptions import SpotifyException
 
+
 # ---------- Config from GitHub Secrets ----------
 IST = timezone(os.getenv("TIMEZONE", "Asia/Kolkata"))
 MARKET = os.getenv("COUNTRY_MARKET", "IN")
@@ -15,6 +16,9 @@ PLAYLIST_ID = os.environ["PLAYLIST_ID"]
 CLIENT_ID = os.environ["SPOTIFY_CLIENT_ID"]
 CLIENT_SECRET = os.environ["SPOTIFY_CLIENT_SECRET"]
 REFRESH_TOKEN = os.environ["SPOTIFY_REFRESH_TOKEN"]
+HISTORY_PATH = "playlist_history.json"
+HISTORY_DAYS = 14  # look-back window
+
 
 # ---------- Helpers ----------
 ID_RE = re.compile(r"^[0-9A-Za-z]{22}$")
@@ -52,6 +56,32 @@ def recent_playlist_ids(sp: Spotify, playlist_id: str, hours=72):
             break
     return ids
 
+import json
+
+def load_history():
+    try:
+        with open(HISTORY_PATH, "r") as f:
+            data = json.load(f)
+    except Exception:
+        data = {"entries": []}
+    # keep only last N days
+    cutoff = (dt.datetime.utcnow() - dt.timedelta(days=HISTORY_DAYS)).isoformat()
+    data["entries"] = [e for e in data["entries"] if e.get("ts", "") >= cutoff]
+    seen = set()
+    for e in data["entries"]:
+        for tid in e.get("tracks", []):
+            seen.add(tid)
+    return data, seen
+
+def save_history(history, track_ids):
+    history["entries"].append({"ts": dt.datetime.utcnow().isoformat(), "tracks": track_ids})
+    try:
+        with open(HISTORY_PATH, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception:
+        pass
+
+
 
 def get_saved_track_ids(sp: Spotify, max_items=200):
     got, ids = 0, []
@@ -70,32 +100,31 @@ def get_saved_track_ids(sp: Spotify, max_items=200):
     return ids
 
 def related_artist_pool(sp: Spotify, market: str, seed_artists=8, related_per_seed=6, top_per_related=5):
-    """Novelty: use *related* artists to your top artists, then their top tracks."""
     pool = []
-    top_arts = (sp.current_user_top_artists(limit=seed_artists, time_range="short_term").get("items", [])
-                + sp.current_user_top_artists(limit=seed_artists, time_range="medium_term").get("items", []))
-    seen_related = set()
-    for a in top_arts[:seed_artists]:
+    id_ok = lambda s: isinstance(s, str) and len(s) == 22
+    tops = (sp.current_user_top_artists(limit=seed_artists, time_range="short_term").get("items", [])
+            + sp.current_user_top_artists(limit=seed_artists, time_range="medium_term").get("items", []))
+    seen = set()
+    for a in tops[:seed_artists]:
         aid = a.get("id")
-        if not aid: 
+        if not id_ok(aid):
             continue
         try:
             rel = sp.artist_related_artists(aid).get("artists", [])[:related_per_seed]
-            for r in rel:
-                ra_id = r.get("id")
-                if not ra_id or ra_id in seen_related:
-                    continue
-                seen_related.add(ra_id)
-                tt = sp.artist_top_tracks(ra_id, country=market).get("tracks", [])[:top_per_related]
-                pool.extend([t.get("id") for t in tt if t and t.get("id")])
         except Exception:
             continue
-    # dedupe
-    seen=set(); out=[]
-    for x in pool:
-        if x and x not in seen:
-            seen.add(x); out.append(x)
-    return out
+        for r in rel:
+            rid = r.get("id")
+            if not id_ok(rid) or rid in seen:
+                continue
+            seen.add(rid)
+            try:
+                tt = sp.artist_top_tracks(rid, country=market).get("tracks", [])[:top_per_related]
+                pool.extend([t.get("id") for t in tt if t and t.get("id")])
+            except Exception:
+                continue
+    return uniq(pool)
+
 
 
 def now_ist():
@@ -118,11 +147,16 @@ class RefreshAuth(SpotifyOAuth):
         super().__init__(
             client_id=CLIENT_ID,
             client_secret=CLIENT_SECRET,
-            redirect_uri="https://example.com/callback",  # not used again; refresh flow only
-            scope="user-top-read playlist-read-private playlist-modify-private playlist-modify-public",
+            redirect_uri="https://example.com/callback",
+            scope=(
+                "user-top-read "
+                "playlist-read-private playlist-modify-private playlist-modify-public "
+                "user-read-recently-played user-library-read"   # ← add these
+            ),
             cache_path=None,
             open_browser=False,
         )
+
     def token(self):
         return self.refresh_access_token(REFRESH_TOKEN)["access_token"]
 
@@ -300,6 +334,9 @@ def main():
     sp = sp_client()
     prof = current_profile()
     n_total = prof["n_tracks"]
+    history, history_ids = load_history()
+    repeat_budget = int(math.floor(n_total * 0.10))  # ≤10% repeats allowed
+
 
     # 20% carry-over from current playlist
     current = read_playlist_track_ids(sp, PLAYLIST_ID)
