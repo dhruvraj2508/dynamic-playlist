@@ -319,28 +319,26 @@ def main():
     discovery_pool = build_discovery(sp, prof, MARKET, avoid_ids=avoid)
     discovery_ids = [d for d in discovery_pool if d not in avoid][:remaining]
 
-    # Final merge
+        # Final merge
     final_ids = uniq(carry + familiar_pick + discovery_ids)[:n_total]
     final_uris = [f"spotify:track:{tid}" for tid in final_ids]  # write URIs
 
     # --- FORCE FRESH "DATE ADDED": remove then add in chunks ---
-existing_ids = read_playlist_track_ids(sp, PLAYLIST_ID)
-if existing_ids:
-    existing_uris = [f"spotify:track:{tid}" for tid in existing_ids]
-    # remove all occurrences (handles duplicates properly)
-    for chunk in chunked(existing_uris, 100):
-        try:
-            sp.playlist_remove_all_occurrences_of_items(PLAYLIST_ID, chunk)
-        except Exception:
-            pass  # if a chunk fails, continue removing others
+    existing_ids = read_playlist_track_ids(sp, PLAYLIST_ID)
+    if existing_ids:
+        existing_uris = [f"spotify:track:{tid}" for tid in existing_ids]
+        for chunk in chunked(existing_uris, 100):
+            try:
+                sp.playlist_remove_all_occurrences_of_items(PLAYLIST_ID, chunk)
+            except Exception:
+                pass  # continue even if a chunk fails
 
-# add the new sequence
-for chunk in chunked(final_uris, 100):
-    sp.playlist_add_items(PLAYLIST_ID, chunk)
+    # add the new sequence
+    for chunk in chunked(final_uris, 100):
+        sp.playlist_add_items(PLAYLIST_ID, chunk)
 
-print(f"OK: wrote {len(final_uris)} tracks to {PLAYLIST_ID} at {now_ist()}. Window={prof}")
-return 0
-
+    print(f"OK: wrote {len(final_uris)} tracks to {PLAYLIST_ID} at {now_ist()}. Window={{'n_tracks': n_total, 'tempo': prof['tempo'], 'energy': prof['energy'], 'familiar_ratio': prof['familiar_ratio']}}")
+    return 0
 
 if __name__ == "__main__":
     raise SystemExit(main())
