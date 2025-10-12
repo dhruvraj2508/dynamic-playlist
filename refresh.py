@@ -110,10 +110,7 @@ def pick_seeds(sp: Spotify):
     seed_trk = clean_seed_list(raw_tracks)[:2]
     return seed_art, seed_trk
 
-def recs(sp: Spotify, prof, seed_art, seed_trk, limit):
-    # Keep only clean 22-char IDs for tracks
-    seed_trk = clean_seed_list(seed_trk)[:2] if isinstance(seed_trk, list) else []
-
+def recs(sp, prof, seed_art, seed_trk, limit):
     params = {
         "limit": min(100, max(1, limit)),
         "market": MARKET,
@@ -124,22 +121,12 @@ def recs(sp: Spotify, prof, seed_art, seed_trk, limit):
         "target_tempo": round(sum(prof["tempo"])/2, 1),
         "target_energy": round(sum(prof["energy"])/2, 2),
         "min_popularity": 20,
+        # ← Use only genre seeds to avoid any URI/ID parsing issues
+        "seed_genres": "pop,edm,bollywood"
     }
-
-    # Use up to 2 track seeds if available, then fill with genres (total seeds ≤ 5)
-    if seed_trk:
-        params["seed_tracks"] = ",".join(seed_trk)
-        # Pick genres that fit your taste
-        params["seed_genres"] = "pop,edm,bollywood"
-    else:
-        # If no track seeds, use only genres
-        params["seed_genres"] = "pop,edm,bollywood"
-
-    # Optional debug:
-    # print("Params for recs:", {k:v for k,v in params.items() if k.startswith("seed_")})
-
     r = sp.recommendations(**params)
     return [t["id"] for t in r.get("tracks", []) if t and t.get("id")]
+
 
 
 def main():
