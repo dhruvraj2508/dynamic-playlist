@@ -111,9 +111,8 @@ def pick_seeds(sp: Spotify):
     return seed_art, seed_trk
 
 def recs(sp: Spotify, prof, seed_art, seed_trk, limit):
-    # Defensive clean again (in case upstream changes)
-    seed_art = clean_seed_list(seed_art)[:3]
-    seed_trk = clean_seed_list(seed_trk)[:2]
+    # Keep only clean 22-char IDs for tracks
+    seed_trk = clean_seed_list(seed_trk)[:2] if isinstance(seed_trk, list) else []
 
     params = {
         "limit": min(100, max(1, limit)),
@@ -127,35 +126,20 @@ def recs(sp: Spotify, prof, seed_art, seed_trk, limit):
         "min_popularity": 20,
     }
 
-    # Provide seeds: artists/tracks if we have them; otherwise fall back to genres.
-    if seed_art:
-        params["seed_artists"] = ",".join(seed_art)
+    # Use up to 2 track seeds if available, then fill with genres (total seeds ≤ 5)
     if seed_trk:
         params["seed_tracks"] = ",".join(seed_trk)
-    if not seed_art and not seed_trk:
-        # sensible defaults for your case
+        # Pick genres that fit your taste
+        params["seed_genres"] = "pop,edm,bollywood"
+    else:
+        # If no track seeds, use only genres
         params["seed_genres"] = "pop,edm,bollywood"
 
-    # Optional quick debug (uncomment if needed)
-    # print("Seeds(artists):", seed_art)
-    # print("Seeds(tracks):", seed_trk)
+    # Optional debug:
     # print("Params for recs:", {k:v for k,v in params.items() if k.startswith("seed_")})
 
     r = sp.recommendations(**params)
     return [t["id"] for t in r.get("tracks", []) if t and t.get("id")]
-
-
-    # Always provide at least one seed. If we have no artist/track seeds, use genres.
-    if seed_art:
-        params["seed_artists"] = ",".join(seed_art)
-    if seed_trk:
-        params["seed_tracks"] = ",".join(seed_trk)
-    if not seed_art and not seed_trk:
-        # Sensible genre defaults for your use-case
-        params["seed_genres"] = "pop,edm,bollywood"
-
-    r = sp.recommendations(**params)
-    return [t["id"] for t in r.get("tracks",[]) if t and t.get("id")]
 
 
 def main():
