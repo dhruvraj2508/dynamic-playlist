@@ -1,35 +1,32 @@
-name: Refresh Spotify Playlist
+name: Dynamic Playlist Refresh
 
 on:
   schedule:
-    # --- Option A: run every 5 minutes (testing) ---
-    - cron: "*/5 * * * *"
-    # --- Option B: 10:00, 13:00, 16:00 IST ---
-    # GitHub uses UTC; IST = UTC+5:30 → 04:30, 07:30, 10:30 UTC
-    - cron: "30 4,7,10 * * *"
-  workflow_dispatch:
+    - cron: "0 6,10,14,18 * * *"   # run 4x daily (UTC); adjust as you like
+  workflow_dispatch: {}             # allow manual runs from the Actions tab
+
+permissions:
+  contents: write                   # <-- REQUIRED so the job can commit back
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-    # (Optional) prevent overlapping runs
-    concurrency:
-      group: refresh-playlist
-      cancel-in-progress: true
 
     steps:
-      - name: Checkout repo
+      - name: Checkout (full history)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0            # needed so auto-commit has a branch history
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
+      - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install spotipy==2.23.0 pytz
+          pip install spotipy requests
 
       - name: Run refresher
         env:
@@ -37,6 +34,26 @@ jobs:
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
           SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
           PLAYLIST_ID: ${{ secrets.PLAYLIST_ID }}
-          COUNTRY_MARKET: ${{ secrets.COUNTRY_MARKET }}
-          TIMEZONE: ${{ secrets.TIMEZONE }}
-        run: python refresh.py
+          COUNTRY_MARKET: "IN"
+          TIMEZONE: "Asia/Kolkata"
+          # Optional overrides:
+          # N_TRACKS: "50"
+          # TEMPO_MIN: "105"
+          # TEMPO_MAX: "132"
+          # ENERGY_MIN: "0.65"
+          # ENERGY_MAX: "0.85"
+          # FAMILIAR_RATIO: "0.70"
+          # CARRY_FRACTION: "0.20"
+          # MAX_REPEAT_FRACTION: "0.10"
+          # SEEN_WINDOW_DAYS: "30"
+          # STATE_PATH: "state/seen.json"
+        run: |
+          python refresh.py
+
+      # ---- This is the step I referenced ----
+      - name: Commit novelty state
+        if: ${{ success() }}        # commit only if the run succeeded
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: update novelty state"
+          file_pattern: state/seen.json
