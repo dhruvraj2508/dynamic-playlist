@@ -16,9 +16,9 @@ from spotipy.client import Spotify
 from spotipy.exceptions import SpotifyException
 
 try:
-    from zoneinfo import ZoneInfo  # py>=3.9
+    from zoneinfo import ZoneInfo  # Python 3.9+
 except Exception:
-    ZoneInfo = None  # fallback if unavailable
+    ZoneInfo = None
 
 # ----------------- Config via ENV -----------------
 PLAYLIST_ID    = os.environ.get("PLAYLIST_ID", "").strip()
@@ -29,9 +29,17 @@ CLIENT_ID      = os.environ["SPOTIFY_CLIENT_ID"]
 CLIENT_SECRET  = os.environ["SPOTIFY_CLIENT_SECRET"]
 REFRESH_TOKEN  = os.environ["SPOTIFY_REFRESH_TOKEN"]
 
+# Novelty/testing knobs (env-driven; safe defaults)
+CARRY_OVER_PCT     = float(os.environ.get("CARRY_OVER_PCT", "0.0"))   # set 0.0 while testing
+FAMILIAR_RATIO_OVR = os.environ.get("FAMILIAR_RATIO", "")             # e.g. "0.5" to override profile
+NOVEL_WINDOW_DAYS  = int(os.environ.get("NOVEL_WINDOW_DAYS", "21"))   # history lookback for repeats
+MAX_REPEAT_PCT     = float(os.environ.get("MAX_REPEAT_PCT", "0.10"))  # ≤10% repeats across runs
+NOVELTY_MIN_DIFF   = float(os.environ.get("NOVELTY_MIN_DIFF", "0.60"))# require ≥60% new vs last run
+WRITE_REPORT       = os.environ.get("WRITE_REPORT", "1") == "1"
+
 # history constraints
 HISTORY_PATH   = "playlist_history.json"
-HISTORY_DAYS   = 14
+HISTORY_DAYS   = NOVEL_WINDOW_DAYS  # use the env-driven lookback
 
 # Logging: hush spotipy
 logging.getLogger("spotipy").setLevel(logging.ERROR)
@@ -188,6 +196,25 @@ def recent_playlist_ids(sp_user: Spotify, playlist_id: str, hours=96) -> List[st
             break
     return ids
 
+# -------------- Track Meta (for reports) ----------
+def fetch_track_meta(sp_app: Spotify, ids: List[str]) -> Dict[str, Dict[str, str]]:
+    meta = {}
+    for chunk in chunked(ids, 50):
+        try:
+            res = sp_app.tracks(chunk)
+            for t in (res.get("tracks") or []):
+                if not t:
+                    continue
+                tid = t.get("id")
+                if not tid:
+                    continue
+                name = t.get("name") or ""
+                arts = ", ".join(a.get("name", "") for a in (t.get("artists") or []))
+                meta[tid] = {"name": name, "artists": arts}
+        except Exception:
+            continue
+    return meta
+
 # -------------- Discovery Builders ----------------
 def related_artist_pool(sp_user: Spotify, sp_app: Spotify, market: str,
                         seed_artists=10, related_per_seed=8, top_per_related=5) -> List[str]:
@@ -251,8 +278,8 @@ def audio_filter(sp_app: Spotify, ids: List[str], tempo_range: Tuple[float, floa
 
     out: List[str] = []
 
-    def fetch_features_cautious(batch: List[str]) -> List[Tuple[str, Dict[str, Any]]]:
-        # progressively smaller chunks; never log, just downshift/skip
+    def fetch_features_cautious(batch: List[str]):
+        # progressively smaller chunks; never blow up, just downshift/skip
         for size in (25, 10, 5, 1):
             ok = True
             i = 0
@@ -288,7 +315,6 @@ def audio_filter(sp_app: Spotify, ids: List[str], tempo_range: Tuple[float, floa
         # fall back: return unfiltered subset if features keep failing
         return ids[:80]
 
-    # dedupe preserve order
     return uniq(out)
 
 # -------------- Discovery Orchestrator ------------
@@ -336,33 +362,72 @@ def save_history(history: Dict[str, Any], track_ids: List[str]) -> None:
     except Exception:
         pass
 
+# -------------- Run Report (CSV per run) ----------
+def write_run_report(sp_app: Spotify,
+                     final_ids: List[str],
+                     carry: List[str],
+                     familiar_pick: List[str],
+                     discovery_ids: List[str],
+                     history_ids: Set[str],
+                     prev_ids: List[str]) -> None:
+    if not WRITE_REPORT:
+        return
+    try:
+        os.makedirs("runs", exist_ok=True)
+        ts = dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        path = f"runs/{ts}.csv"
+
+        # source labeling
+        source = {}
+        for t in carry:           source[t] = "carry"
+        for t in familiar_pick:   source.setdefault(t, "familiar")
+        for t in discovery_ids:   source.setdefault(t, "discovery")
+
+        meta = fetch_track_meta(sp_app, final_ids)
+        prev_set = set(prev_ids)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("track_id,name,artists,source,was_in_history,was_in_prev_playlist\n")
+            for tid in final_ids:
+                m = meta.get(tid, {"name": "", "artists": ""})
+                f.write(
+                    f"{tid},\"{m['name'].replace('\"','')}\",\"{m['artists'].replace('\"','')}\","
+                    f"{source.get(tid,'?')},{int(tid in history_ids)},{int(tid in prev_set)}\n"
+                )
+        print(f"REPORT: wrote {path}")
+    except Exception:
+        pass
+
 # --------------------- Main -----------------------
 def main():
     if not PLAYLIST_ID:
         print("PLAYLIST_ID env var is missing")
         return 1
 
-    sp_user = sp_user_client()  # user-scoped
-    sp_app  = sp_app_client()   # app-scoped
+    sp_user = sp_user_client()  # user-scoped (uses refresh token)
+    sp_app  = sp_app_client()   # app-scoped (search, features, related, etc.)
 
     prof = current_profile()
     n_total = prof["n_tracks"]
 
-    # history-based repeat cap (≤10%)
+    # history-based repeat cap
     history, history_ids = load_history()
-    repeat_budget = int(math.floor(n_total * 0.10))
+    repeat_budget = int(math.floor(n_total * MAX_REPEAT_PCT))
 
-    # carry-over 20% from current playlist
+    # carry-over (testing: env can force 0.0)
+    carry_n = int(math.floor(n_total * CARRY_OVER_PCT))
     current = read_playlist_track_ids(sp_user, PLAYLIST_ID)
-    carry_n = int(math.floor(n_total * 0.20))
     carry = current[:carry_n] if current else []
+
+    # familiar ratio (profile or env override)
+    familiar_ratio = float(FAMILIAR_RATIO_OVR) if FAMILIAR_RATIO_OVR else prof["familiar_ratio"]
+
+    # familiar target
+    familiar_target = int(math.floor(n_total * familiar_ratio))
 
     # familiar from user's top tracks (short + medium)
     top_short = safe_call(sp_user.current_user_top_tracks, limit=50, time_range="short_term").get("items", [])
     top_med   = safe_call(sp_user.current_user_top_tracks, limit=50, time_range="medium_term").get("items", [])
     familiar_ids_src = uniq([t.get("id") for t in (top_short + top_med) if t and t.get("id")])
-
-    familiar_target = int(math.floor(n_total * prof["familiar_ratio"]))
 
     # prefer never-before-used first, then allow ≤ repeat_budget from history if needed
     familiar_clean = [t for t in familiar_ids_src if t not in carry and t not in history_ids]
@@ -387,6 +452,36 @@ def main():
 
     # final merge
     final_ids  = uniq(carry + familiar_pick + discovery_ids)[:n_total]
+
+    # --- NOVELTY CHECK vs previous run ---
+    prev_ids = current  # what was in the playlist at start of run
+    if prev_ids:
+        overlap = len(set(final_ids) & set(prev_ids))
+        overlap_pct = overlap / max(1, len(final_ids))
+        new_pct = 1.0 - overlap_pct
+        print(f"NOVELTY: {new_pct:.1%} new vs previous run "
+              f"({len(final_ids)-overlap}/{len(final_ids)} new).")
+
+        if new_pct < NOVELTY_MIN_DIFF:
+            # Fallback: push more discovery by draining familiar repeats & re-sampling discovery
+            shortfall = int(math.ceil((NOVELTY_MIN_DIFF - new_pct) * len(final_ids)))
+            print(f"NOVELTY fallback: need ~{shortfall} more new tracks; re-sampling…")
+            avoid_more = set(history_ids) | set(prev_ids) | set(final_ids)
+            extra_pool = build_discovery(sp_user, sp_app, prof, MARKET, avoid_ids=avoid_more)
+            extra = [t for t in extra_pool if t not in avoid_more][:shortfall + 10]
+            # replace from end to keep earlier sequencing
+            taken = 0
+            for i in range(len(final_ids)-1, -1, -1):
+                if taken >= len(extra):
+                    break
+                if final_ids[i] in prev_ids:
+                    final_ids[i] = extra[taken]
+                    taken += 1
+            final_ids = uniq(final_ids)[:n_total]
+            overlap = len(set(final_ids) & set(prev_ids))
+            new_pct = 1.0 - overlap / max(1, len(final_ids))
+            print(f"NOVELTY after fallback: {new_pct:.1%} new.")
+
     final_uris = [f"spotify:track:{tid}" for tid in final_ids]
 
     # write: remove-all then add (fresh "Date added")
@@ -407,10 +502,13 @@ def main():
     # persist run to history (for ≤10% repeats next time)
     save_history(history, final_ids)
 
+    # write run report CSV
+    write_run_report(sp_app, final_ids, carry, familiar_pick, discovery_ids, history_ids, prev_ids)
+
     print(
         f"OK: wrote {len(final_uris)} tracks to {PLAYLIST_ID} at {now_ist()}."
         f" Window={{'n_tracks': {n_total}, 'tempo': {prof['tempo']}, 'energy': {prof['energy']},"
-        f" 'familiar_ratio': {prof['familiar_ratio']}}}"
+        f" 'familiar_ratio': {familiar_ratio}}}"
     )
     return 0
 
