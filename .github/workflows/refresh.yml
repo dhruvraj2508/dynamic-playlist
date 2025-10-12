@@ -24,7 +24,6 @@ jobs:
           PLAYLIST_ID: ${{ secrets.PLAYLIST_ID }}
           COUNTRY_MARKET: ${{ secrets.COUNTRY_MARKET }}
           TIMEZONE: ${{ secrets.TIMEZONE }}
-        - run: pip install spotipy==2.23.0 pytz
         run: python refresh.py
 
 
