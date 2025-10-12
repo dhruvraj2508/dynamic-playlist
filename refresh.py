@@ -1,47 +1,22 @@
-# refresh.py
-# pip dependencies: spotipy pytz
-import os, datetime as dt
+# refresh.py — minimal & robust: seeds = current playlist tracks (fallback to safe genres)
+# deps: spotipy==2.23.0, pytz  (already in your workflow)
+
+import os, re, datetime as dt
 from pytz import timezone
 import spotipy
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 
-import re
-ID_RE = re.compile(r"^[0-9A-Za-z]{22}$")
-
-def extract_id(value: str):
-    if not value or not isinstance(value, str):
-        return None
-    if ID_RE.match(value):  # bare ID
-        return value
-    if value.startswith("spotify:"):
-        parts = value.split(":")
-        if len(parts) >= 3 and ID_RE.match(parts[-1]):
-            return parts[-1]
-    if "open.spotify.com" in value:
-        last = value.strip().split("/")[-1].split("?")[0]
-        if ID_RE.match(last):
-            return last
-    return None
-
-def clean_seed_list(values):
-    out, seen = [], set()
-    for v in values or []:
-        vid = extract_id(v)
-        if vid and vid not in seen:
-            seen.add(vid); out.append(vid)
-        if len(out) >= 5:
-            break
-    return out
-
-
+# -------- Settings from GitHub Secrets --------
 IST = timezone(os.getenv("TIMEZONE","Asia/Kolkata"))
 MARKET = os.getenv("COUNTRY_MARKET","IN")
 PLAYLIST_ID = os.environ["PLAYLIST_ID"]
-
 CLIENT_ID = os.environ["SPOTIFY_CLIENT_ID"]
 CLIENT_SECRET = os.environ["SPOTIFY_CLIENT_SECRET"]
 REFRESH_TOKEN = os.environ["SPOTIFY_REFRESH_TOKEN"]
+
+# -------- Helpers --------
+ID_RE = re.compile(r"^[0-9A-Za-z]{22}$")
 
 def now_ist():
     return dt.datetime.now(IST)
@@ -49,13 +24,13 @@ def now_ist():
 def current_profile():
     h = now_ist().hour
     if 10 <= h < 13:     # 10–13 High-energy
-        return {"n_tracks":50,"tempo":(105,130),"energy":(0.65,0.85),"valence":(0.50,0.75),"familiar_ratio":0.70}
+        return {"n_tracks":50,"tempo":(105,130),"energy":(0.65,0.85),"familiar_ratio":0.70}
     elif 13 <= h < 16:   # 13–16 Mellow
-        return {"n_tracks":50,"tempo":(70,95),  "energy":(0.30,0.50),"valence":(0.35,0.60),"familiar_ratio":0.70}
+        return {"n_tracks":50,"tempo":(70,95),  "energy":(0.30,0.50),"familiar_ratio":0.70}
     elif 16 <= h < 20:   # 16–20 Focused high-energy
-        return {"n_tracks":50,"tempo":(105,132),"energy":(0.60,0.80),"valence":(0.45,0.70),"familiar_ratio":0.70}
+        return {"n_tracks":50,"tempo":(105,132),"energy":(0.60,0.80),"familiar_ratio":0.70}
     else:                # Off-hours mellow
-        return {"n_tracks":40,"tempo":(70,95),  "energy":(0.30,0.50),"valence":(0.35,0.60),"familiar_ratio":0.70}
+        return {"n_tracks":40,"tempo":(70,95),  "energy":(0.30,0.50),"familiar_ratio":0.70}
 
 class RefreshAuth(SpotifyOAuth):
     def __init__(self):
@@ -71,8 +46,25 @@ class RefreshAuth(SpotifyOAuth):
         return self.refresh_access_token(REFRESH_TOKEN)["access_token"]
 
 def sp_client() -> Spotify:
-    token = RefreshAuth().token()
-    return Spotify(auth=token)
+    return Spotify(auth=RefreshAuth().token())
+
+def extract_id(val: str):
+    if not val or not isinstance(val, str): return None
+    if ID_RE.match(val): return val
+    if val.startswith("spotify:"):
+        parts = val.split(":")
+        if len(parts)>=3 and ID_RE.match(parts[-1]): return parts[-1]
+    if "open.spotify.com" in val:
+        last = val.strip().split("/")[-1].split("?")[0]
+        if ID_RE.match(last): return last
+    return None
+
+def uniq(seq):
+    seen=set(); out=[]
+    for x in seq:
+        if x and x not in seen:
+            seen.add(x); out.append(x)
+    return out
 
 def read_playlist_track_ids(sp: Spotify, playlist_id: str):
     ids = []
@@ -80,34 +72,20 @@ def read_playlist_track_ids(sp: Spotify, playlist_id: str):
     while True:
         for it in results.get("items", []):
             tr = it.get("track")
-            if tr and tr.get("id"): ids.append(tr["id"])
+            tid = tr and tr.get("id")
+            if tid: ids.append(tid)
         if results.get("next"): results = sp.next(results)
         else: break
     return ids
 
-def uniq(seq):
-    seen=set(); out=[]
-    for x in seq:
-        if x and x not in seen: seen.add(x); out.append(x)
-    return out
-
-def pick_seeds(sp):
-    top_art = sp.current_user_top_artists(limit=20, time_range="short_term").get("items", [])
-    top_trk = sp.current_user_top_tracks(limit=20, time_range="short_term").get("items", [])
-    raw_tracks  = [t.get("id") or t.get("uri") for t in top_trk]
-    seed_trk = clean_seed_list(raw_tracks)[:2]  # we’ll use tracks first
-    return [], seed_trk  # (we’re skipping artist seeds for now)
-
-
-def recs(sp, prof, seed_art, seed_trk, limit):
+# -------- Core logic --------
+def recommendations(sp: Spotify, prof, seed_ids, limit):
     if limit <= 0:
         return []
 
-    # 1) Prefer track seeds (already cleaned to 22-char IDs)
-    seed_trk = clean_seed_list(seed_trk)[:2] if isinstance(seed_trk, list) else []
-
-    # 2) Safe default genres if no tracks available (must be a LIST)
-    default_genres = ["pop", "edm", "dance", "indie", "hip-hop"]
+    # Clean to proper 22-char IDs; take up to 2 track seeds
+    seed_ids = [extract_id(x) for x in seed_ids]
+    seed_ids = [x for x in seed_ids if x][:2]
 
     params = {
         "limit": min(100, max(1, limit)),
@@ -116,52 +94,50 @@ def recs(sp, prof, seed_art, seed_trk, limit):
         "max_tempo":  prof["tempo"][1],
         "min_energy": prof["energy"][0],
         "max_energy": prof["energy"][1],
-        "target_tempo": round(sum(prof["tempo"]) / 2, 1),
-        "target_energy": round(sum(prof["energy"]) / 2, 2),
+        "target_tempo": round(sum(prof["tempo"])/2, 1),
+        "target_energy": round(sum(prof["energy"])/2, 2),
         "min_popularity": 20,
     }
 
-    if seed_trk:
-        params["seed_tracks"] = ",".join(seed_trk)
+    # Always provide at least one seed as a LIST
+    if seed_ids:
+        params["seed_tracks"] = seed_ids
     else:
-        params["seed_genres"] = default_genres  # LIST, not string
+        # Safe, widely-available genres as LIST (no "bollywood" to avoid 404s)
+        params["seed_genres"] = ["pop", "dance", "edm", "indie", "hip-hop"]
 
-    # Optional debug (uncomment briefly if needed):
-    # print("Using seeds:", {k:v for k,v in params.items() if k.startswith("seed_")})
-
-    r = sp.recommendations(**params)
-    return [t["id"] for t in r.get("tracks", []) if t and t.get("id")]
-
+    rec = sp.recommendations(**params)
+    return [t["id"] for t in rec.get("tracks", []) if t and t.get("id")]
 
 def main():
     sp = sp_client()
     prof = current_profile()
     n_total = prof["n_tracks"]
 
-    # carry 20%
+    # 20% carry-over
     current = read_playlist_track_ids(sp, PLAYLIST_ID)
-    keep_n = int(n_total * 0.20)
-    carry = current[:keep_n] if current else []
+    carry_n = int(n_total * 0.20)
+    carry = current[:carry_n] if current else []
 
-    # familiar 70%
-    seed_art, seed_trk = pick_seeds(sp)
+    # Familiar 70% from user's top tracks
     top_short = sp.current_user_top_tracks(limit=50, time_range="short_term").get("items",[])
     top_med   = sp.current_user_top_tracks(limit=50, time_range="medium_term").get("items",[])
-    familiar_ids = uniq([t["id"] for t in (top_short+top_med) if t and t.get("id")])
+    familiar_ids = uniq([t.get("id") for t in (top_short+top_med) if t and t.get("id")])
     familiar_target = int(n_total * prof["familiar_ratio"])
     familiar_pick = [t for t in familiar_ids if t not in carry][:familiar_target]
 
-    # discovery
+    # Discovery with seeds from current playlist (most robust)
     remaining = max(0, n_total - len(carry) - len(familiar_pick))
-    discovery_ids = [d for d in recs(sp, prof, seed_art, seed_trk, remaining) if d not in carry and d not in familiar_pick][:remaining]
+    seed_from_playlist = current[:2]  # use current tracks as seeds
+    discovery_ids = [d for d in recommendations(sp, prof, seed_from_playlist, remaining)
+                     if d not in carry and d not in familiar_pick][:remaining]
 
     final_ids = uniq(carry + familiar_pick + discovery_ids)[:n_total]
-    final_uris = [f"spotify:track:{tid}" for tid in final_ids]
+    final_uris = [f"spotify:track:{tid}" for tid in final_ids]  # write URIs
+
     sp.playlist_replace_items(PLAYLIST_ID, final_uris)
-
-
-
-    print(f"Refreshed {PLAYLIST_ID} with {len(final_ids)} tracks at {now_ist()} ({prof})")
+    print(f"OK: wrote {len(final_uris)} tracks to {PLAYLIST_ID} at {now_ist()}. Window={prof}")
+    return 0
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
