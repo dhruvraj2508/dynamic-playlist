@@ -10,18 +10,14 @@ import re
 ID_RE = re.compile(r"^[0-9A-Za-z]{22}$")
 
 def extract_id(value: str):
-    """Return a clean 22-char Spotify ID from an ID, URI, or URL; else None."""
     if not value or not isinstance(value, str):
         return None
-    # Bare ID
-    if ID_RE.match(value):
+    if ID_RE.match(value):  # bare ID
         return value
-    # URI: spotify:artist:<id> or spotify:track:<id>
     if value.startswith("spotify:"):
         parts = value.split(":")
         if len(parts) >= 3 and ID_RE.match(parts[-1]):
             return parts[-1]
-    # URL: https://open.spotify.com/{type}/<id>(?... )
     if "open.spotify.com" in value:
         last = value.strip().split("/")[-1].split("?")[0]
         if ID_RE.match(last):
@@ -29,16 +25,15 @@ def extract_id(value: str):
     return None
 
 def clean_seed_list(values):
-    """Map list of ids/uris/urls → unique valid IDs (max 5)."""
     out, seen = [], set()
     for v in values or []:
         vid = extract_id(v)
         if vid and vid not in seen:
-            seen.add(vid)
-            out.append(vid)
+            seen.add(vid); out.append(vid)
         if len(out) >= 5:
             break
     return out
+
 
 IST = timezone(os.getenv("TIMEZONE","Asia/Kolkata"))
 MARKET = os.getenv("COUNTRY_MARKET","IN")
@@ -96,37 +91,23 @@ def uniq(seq):
         if x and x not in seen: seen.add(x); out.append(x)
     return out
 
-def pick_seeds(sp: Spotify):
-    # Pull top artists/tracks (short_term)
+def pick_seeds(sp):
     top_art = sp.current_user_top_artists(limit=20, time_range="short_term").get("items", [])
     top_trk = sp.current_user_top_tracks(limit=20, time_range="short_term").get("items", [])
-
-    # Get whatever identifier is available (id or uri)
-    raw_artists = [a.get("id") or a.get("uri") for a in top_art]
     raw_tracks  = [t.get("id") or t.get("uri") for t in top_trk]
+    seed_trk = clean_seed_list(raw_tracks)[:2]  # we’ll use tracks first
+    return [], seed_trk  # (we’re skipping artist seeds for now)
 
-    # Clean to bare IDs and cap to 3 artists + 2 tracks
-    seed_art = clean_seed_list(raw_artists)[:3]
-    seed_trk = clean_seed_list(raw_tracks)[:2]
-    return seed_art, seed_trk
 
 def recs(sp, prof, seed_art, seed_trk, limit):
     if limit <= 0:
         return []
 
-    # Ask Spotify which genre seeds are valid for *your* account
-    try:
-        allowed = set(sp.recommendation_genre_seeds() or [])
-    except Exception:
-        allowed = set()
+    # 1) Prefer track seeds (already cleaned to 22-char IDs)
+    seed_trk = clean_seed_list(seed_trk)[:2] if isinstance(seed_trk, list) else []
 
-    # Our preferred genres (we'll keep only those that are allowed)
-    preferred = ["pop", "edm", "dance", "indian", "indie", "bollywood"]
-
-    # Keep valid ones; if empty, fall back to whatever Spotify allows
-    seeds = [g for g in preferred if g in allowed]
-    if not seeds:
-        seeds = list(allowed)[:3]  # safe fallback
+    # 2) Safe default genres if no tracks available (must be a LIST)
+    default_genres = ["pop", "edm", "dance", "indie", "hip-hop"]
 
     params = {
         "limit": min(100, max(1, limit)),
@@ -135,16 +116,21 @@ def recs(sp, prof, seed_art, seed_trk, limit):
         "max_tempo":  prof["tempo"][1],
         "min_energy": prof["energy"][0],
         "max_energy": prof["energy"][1],
-        "target_tempo": round(sum(prof["tempo"])/2, 1),
-        "target_energy": round(sum(prof["energy"])/2, 2),
+        "target_tempo": round(sum(prof["tempo"]) / 2, 1),
+        "target_energy": round(sum(prof["energy"]) / 2, 2),
         "min_popularity": 20,
-        "seed_genres": seeds,   # <-- pass a LIST of valid genres
     }
+
+    if seed_trk:
+        params["seed_tracks"] = ",".join(seed_trk)
+    else:
+        params["seed_genres"] = default_genres  # LIST, not string
+
+    # Optional debug (uncomment briefly if needed):
+    # print("Using seeds:", {k:v for k,v in params.items() if k.startswith("seed_")})
 
     r = sp.recommendations(**params)
     return [t["id"] for t in r.get("tracks", []) if t and t.get("id")]
-
-
 
 
 def main():
@@ -172,6 +158,7 @@ def main():
     final_ids = uniq(carry + familiar_pick + discovery_ids)[:n_total]
     final_uris = [f"spotify:track:{tid}" for tid in final_ids]
     sp.playlist_replace_items(PLAYLIST_ID, final_uris)
+
 
 
     print(f"Refreshed {PLAYLIST_ID} with {len(final_ids)} tracks at {now_ist()} ({prof})")
