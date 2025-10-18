@@ -21,6 +21,26 @@ import requests
 import spotipy
 from spotipy.client import Spotify, SpotifyException
 
+# --- robust env readers (handle empty/None gracefully) ---
+def ENV(name: str, default=None):
+    v = os.getenv(name)
+    return default if v is None or v == "" else v
+
+def ENV_INT(name: str, default: int) -> int:
+    v = ENV(name, default)
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return int(default)
+
+def ENV_FLOAT(name: str, default: float) -> float:
+    v = ENV(name, default)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 # ------------------ Env & Defaults ------------------
 
 ENV = os.environ.get
@@ -59,25 +79,6 @@ MAX_WRITE_CHUNK  = 100
 AUDIO_FEATURES_CHUNK = 40  # if you enable audio-features again later
 
 
-
-# --- robust env readers (handle empty/None gracefully) ---
-def ENV(name: str, default=None):
-    v = os.getenv(name)
-    return default if v is None or v == "" else v
-
-def ENV_INT(name: str, default: int) -> int:
-    v = ENV(name, default)
-    try:
-        return int(v)
-    except (TypeError, ValueError):
-        return int(default)
-
-def ENV_FLOAT(name: str, default: float) -> float:
-    v = ENV(name, default)
-    try:
-        return float(v)
-    except (TypeError, ValueError):
-        return float(default)
 
 
 # ------------------ Time helpers ------------------
