@@ -38,7 +38,7 @@ TEMPO_MIN        = float(ENV("TEMPO_MIN", "105"))
 TEMPO_MAX        = float(ENV("TEMPO_MAX", "132"))
 ENERGY_MIN       = float(ENV("ENERGY_MIN", "0.65"))
 ENERGY_MAX       = float(ENV("ENERGY_MAX", "0.85"))
-FAMILIAR_RATIO   = float(ENV("FAMILIAR_RATIO", "0.30"))
+FAMILIAR_RATIO   = float(ENV("FAMILIAR_RATIO", "0.60"))
 CARRY_FRACTION   = float(ENV("CARRY_FRACTION", "0.20"))
 
 # Novelty memory
@@ -278,7 +278,7 @@ def current_profile() -> Dict[str, Any]:
     if 10 <= hour < 13:
         tempo = (105, 132)
         energy = (0.65, 0.85)
-        fam = 0.70
+        fam = 0.60
     elif 13 <= hour < 16:
         tempo = (85, 110)
         energy = (0.40, 0.65)
@@ -286,7 +286,7 @@ def current_profile() -> Dict[str, Any]:
     elif 16 <= hour < 20:
         tempo = (100, 130)
         energy = (0.60, 0.85)
-        fam = 0.70
+        fam = 0.60
     else:
         tempo = (TEMPO_MIN, TEMPO_MAX)
         energy = (ENERGY_MIN, ENERGY_MAX)
