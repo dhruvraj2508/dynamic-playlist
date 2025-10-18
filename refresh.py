@@ -18,8 +18,6 @@ import datetime as dt
 from typing import List, Dict, Any, Optional, Iterable
 
 import requests
-import spotipy
-from spotipy.client import Spotify, SpotifyException
 
 # --- robust env readers (handle empty/None gracefully) ---
 def ENV(name: str, default=None):
@@ -437,6 +435,40 @@ def build_discovery(sp: SPWrap, seeds_tracks: List[str], seeds_artists: List[str
         )
 
     return uniq(pool)
+
+# --- Spotify client factory (put ABOVE main()) ---
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth
+
+SPOTIFY_CLIENT_ID     = ENV("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = ENV("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_REFRESH_TOKEN = ENV("SPOTIFY_REFRESH_TOKEN")
+REDIRECT_URI          = ENV("REDIRECT_URI", "https://example.com/callback")
+
+# include all scopes you actually use (add/remove as needed)
+SCOPES = "playlist-read-private playlist-modify-private playlist-modify-public user-top-read user-library-read user-read-recently-played"
+
+def sp_client() -> spotipy.Spotify:
+    """
+    Creates a Spotipy client by refreshing the access token on every run.
+    Works in GitHub Actions (no local cache).
+    """
+    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET or not SPOTIFY_REFRESH_TOKEN:
+        raise RuntimeError("Missing Spotify creds: ensure SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN are set.")
+
+    oauth = SpotifyOAuth(
+        client_id=SPOTIFY_CLIENT_ID,
+        client_secret=SPOTIFY_CLIENT_SECRET,
+        redirect_uri=REDIRECT_URI,
+        scope=SCOPES,
+        open_browser=False,
+        cache_path=None,          # no local cache in Actions
+        requests_timeout=20,
+    )
+    token_info = oauth.refresh_access_token(SPOTIFY_REFRESH_TOKEN)
+    access_token = token_info["access_token"]
+    return spotipy.Spotify(auth=access_token)
+
 
 # ---------- Main ----------
 def main():
