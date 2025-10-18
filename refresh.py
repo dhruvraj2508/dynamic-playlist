@@ -31,6 +31,11 @@ REFRESH_TOKEN    = ENV("SPOTIFY_REFRESH_TOKEN", "")
 PLAYLIST_ID_RAW  = ENV("PLAYLIST_ID", "")
 MARKET           = ENV("COUNTRY_MARKET", "IN")
 TZ_NAME          = ENV("TIMEZONE", "Asia/Kolkata")
+CARRY_RATIO = float(ENV("CARRY_RATIO", "0.10"))         # 10% of current playlist carried into next run
+MAX_REPEAT_FRACTION = float(ENV("MAX_REPEAT_FRACTION", "0.10"))  # ≤10% of playlist may repeat per run
+NOVELTY_LOG_PATH = ENV("NOVELTY_LOG_PATH", "novelty_log.json")   # file in repo tracking recent runs
+NOVELTY_KEEP_DAYS = int(ENV("NOVELTY_KEEP_DAYS", "14"))          # lookback window for repeats
+
 
 # Tuning & profile defaults (override via env if you want)
 N_TRACKS         = int(ENV("N_TRACKS", "50"))
@@ -170,6 +175,69 @@ def playlist_count(sp: SPWrap, playlist_id: str) -> int:
         return int(meta.get("total", 0))
     except Exception:
         return 0
+
+import json, datetime, os
+from datetime import timezone, timedelta
+
+def _today_iso_tz(tz_str):
+    # re-use your TIMEZONE if you already have a helper; otherwise keep this simple UTC date
+    return datetime.datetime.now(timezone.utc).date().isoformat()
+
+def load_novelty_log(path):
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, dict) and "runs" in data and isinstance(data["runs"], list):
+                return data
+    except Exception:
+        pass
+    return {"runs": []}
+
+def prune_novelty_log(log, keep_days=14):
+    cutoff = datetime.datetime.now(timezone.utc) - timedelta(days=keep_days)
+    kept = []
+    for r in log["runs"]:
+        try:
+            ts = datetime.datetime.fromisoformat(r.get("ts"))
+        except Exception:
+            ts = None
+        if ts is None or ts >= cutoff:
+            kept.append(r)
+    log["runs"] = kept
+    return log
+
+def save_novelty_log(path, log):
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(log, f, indent=2, ensure_ascii=False)
+
+def recent_track_ids(log):
+    ids = set()
+    for r in log.get("runs", []):
+        for tid in r.get("tracks", []):
+            if tid:
+                ids.add(tid)
+    return ids
+
+def cap_repeats(prev_ids, desired_ids, n_total, max_repeat_fraction):
+    """
+    Ensure at most floor(n_total * max_repeat_fraction) items overlap with prev_ids.
+    We keep items in order and drop overflow; caller can backfill with new picks.
+    """
+    max_repeats = max(0, int(n_total * max_repeat_fraction))
+    out = []
+    repeats_kept = 0
+    for tid in desired_ids:
+        if tid in prev_ids:
+            if repeats_kept < max_repeats:
+                out.append(tid)
+                repeats_kept += 1
+            else:
+                # skip this repeated one; caller should later fill the gap with novel picks
+                continue
+        else:
+            out.append(tid)
+    return out, max_repeats, repeats_kept
+
 
 # ------------------ Recommendations (seed-safe) ------------------
 
@@ -344,96 +412,87 @@ def build_discovery(sp: SPWrap, seeds_tracks: List[str], seeds_artists: List[str
 
     return uniq(pool)
 
-# ------------------ Main ------------------
-
-def main() -> int:
-    if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN and PLAYLIST_ID):
-        print("Missing credentials: ensure SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN, PLAYLIST_ID are set.")
-        return 2
-
-    sp = SPWrap()
+# ---------- Main ----------
+def main():
+    sp = sp_client()
     prof = current_profile()
-    n_total = int(prof["n_tracks"])
 
-    # 1) Read current playlist and compute carry
-    current = playlist_track_ids(sp, PLAYLIST_ID)
-    carry_n = int(math.floor(n_total * CARRY_FRACTION))
-    carry = current[:carry_n] if current else []
+    # force the 60/40 split you asked for (override whatever profile says)
+    prof["familiar_ratio"] = 0.60
+    n_total = int(prof.get("n_tracks", 50))
 
-    # 2) Familiar from user's top tracks (short + medium). If scopes missing, this just returns [] and we handle it.
-    top_short = user_top_tracks(sp, "short_term")
-    top_med   = user_top_tracks(sp, "medium_term")
-    familiar_ids = uniq(top_short + top_med)
-    familiar_target = int(math.floor(n_total * prof["familiar_ratio"]))
-    familiar_pick = [t for t in familiar_ids if t not in carry][:familiar_target]
+    # 1) Carry over up to 20% from the current playlist (keeps a little continuity)
+    current_ids = read_playlist_track_ids(sp, PLAYLIST_ID) or []
+    carry_n = max(0, int(math.floor(n_total * 0.20)))
+    carry = current_ids[:carry_n]
 
-    # 3) Discovery from recommendations with safe seeds (playlist tracks first, then tops)
+    # 2) Build the familiar pool from your Top Tracks (short + medium term)
+    top_short = safe_call(sp.current_user_top_tracks, limit=50, time_range="short_term") or {}
+    top_med   = safe_call(sp.current_user_top_tracks, limit=50, time_range="medium_term") or {}
+    top_short_items = top_short.get("items", []) if isinstance(top_short, dict) else []
+    top_med_items   = top_med.get("items", []) if isinstance(top_med, dict) else []
+    familiar_pool = uniq([t.get("id") for t in (top_short_items + top_med_items) if t and t.get("id")])
+
+    # 3) Pick familiar (excluding anything we already carry)
+    familiar_target = max(0, int(math.floor(n_total * prof["familiar_ratio"])))
+    familiar_pick = [t for t in familiar_pool if t not in carry][:familiar_target]
+
+    # 4) Discovery pool (exclude carry + familiar + the rest of current to avoid “re-adds”)
+    avoid = set(carry) | set(familiar_pick) | set(current_ids)
+    discovery_pool = build_discovery(sp, prof, MARKET, avoid_ids=avoid) or []
+
+    # 5) Fill discovery slice
     remaining = max(0, n_total - len(carry) - len(familiar_pick))
-    seed_from_playlist = current[:3] if current else []
-    seed_from_top = familiar_ids[:3]
-    discovery_pool = build_discovery(
-        sp,
-        seeds_tracks=seed_from_playlist or seed_from_top,
-        seeds_artists=[],  # keep simple; we avoided artist fetches to reduce errors
-        prof=prof,
-        needed=remaining
-    )
-    discovery_ids = [d for d in discovery_pool if d not in carry and d not in familiar_pick][:remaining]
+    discovery_ids = [d for d in discovery_pool if d not in avoid][:remaining]
 
-    # 4) Merge
-    base_final = uniq(carry + familiar_pick + discovery_ids)[:n_total]
+    # 6) If discovery ran short, top up so we ALWAYS hit n_total
+    if len(discovery_ids) < remaining:
+        # first, try to top up with more familiar (still excluding already chosen)
+        need = remaining - len(discovery_ids)
+        familiar_topup = [t for t in familiar_pool
+                          if t not in carry and t not in familiar_pick and t not in discovery_ids][:need]
+        discovery_ids.extend(familiar_topup)
 
-    # 5) Novelty memory across runs
-    state = load_state(STATE_PATH)
-    state = prune_state(state, SEEN_WINDOW_DAYS)
-    recent_seen = seen_recent_set(state)
-    final_ids = clamp_novelty(base_final, recent_seen, n_total, MAX_REPEAT_FRAC)
+    if len(carry) + len(familiar_pick) + len(discovery_ids) < n_total:
+        # absolute last resort: take from current playlist leftovers (keeps length stable)
+        need = n_total - (len(carry) + len(familiar_pick) + len(discovery_ids))
+        leftovers = [t for t in current_ids if t not in carry and t not in familiar_pick and t not in discovery_ids][:need]
+        discovery_ids.extend(leftovers)
 
-    # If novelty clamp reduced too much, try to backfill with more discovery
-    if len(final_ids) < n_total:
-        need = n_total - len(final_ids)
-        more = build_discovery(
-            sp,
-            seeds_tracks=final_ids[:3] or seed_from_playlist or seed_from_top,
-            seeds_artists=[],
-            prof=prof,
-            needed=need
-        )
-        fill = [t for t in more if t not in final_ids and t not in recent_seen][:need]
-        final_ids = uniq(final_ids + fill)[:n_total]
-
-    # 6) Write to playlist (replace + top-up guard)
+    # 7) Final assembly (dedup + truncate to target)
+    final_ids = uniq(carry + familiar_pick + discovery_ids)[:n_total]
     final_uris = [f"spotify:track:{tid}" for tid in final_ids]
-    playlist_replace_all(sp, PLAYLIST_ID, final_uris)
 
-    # Verify and top up if Spotify wrote fewer items (rare but happens)
-    count_after = playlist_count(sp, PLAYLIST_ID)
-    if count_after < n_total:
-        need = n_total - count_after
-        extra = safe_recommendations(
-            sp,
-            seed_tracks=final_ids[:3] or seed_from_playlist or seed_from_top,
-            limit=min(50, max(20, need)),
-            min_energy=prof["energy"][0], max_energy=prof["energy"][1],
-            min_tempo=prof["tempo"][0],  max_tempo=prof["tempo"][1],
-        )
-        extra = [t for t in extra if t not in final_ids][:need]
-        if extra:
-            extra_uris = [f"spotify:track:{tid}" for tid in extra]
-            for i in range(0, len(extra_uris), MAX_WRITE_CHUNK):
-                sp.call(sp.sp.playlist_add_items, PLAYLIST_ID, extra_uris[i:i+MAX_WRITE_CHUNK])
-            final_ids = uniq(final_ids + extra)[:n_total]
+    # 8) Write back to the SAME playlist (handle >100 in safe chunks)
+    # Replace first batch (up to 100)
+    first_batch = final_uris[:100]
+    safe_call(sp.playlist_replace_items, PLAYLIST_ID, first_batch)
 
-    # 7) Record novelty state and save
-    record_run(state, final_ids)
-    save_state(STATE_PATH, state)
+    # Append any remaining in 100-sized chunks
+    idx = 100
+    while idx < len(final_uris):
+        safe_call(sp.playlist_add_items, PLAYLIST_ID, final_uris[idx:idx+100])
+        idx += 100
 
+    # 9) Log a clear summary so you can verify splits & lengths in the Actions logs
     print(
-        f"OK: wrote {len(final_ids)} tracks to *** at {now_ist_str()}."
-        f" Window={{'tempo': {prof['tempo']}, 'energy': {prof['energy']}, 'familiar_ratio': {prof['familiar_ratio']}}}"
+        "OK: wrote {n} tracks to {pl} at {ts}. "
+        "Breakdown: carry={c}, familiar={f}, discovery={d}. "
+        "Window={{'n_tracks': {n_total}, 'tempo': {tempo}, 'energy': {energy}, 'familiar_ratio': {fr}}}".format(
+            n=len(final_uris),
+            pl=PLAYLIST_ID,
+            ts=now_ist(),
+            c=len(carry),
+            f=len(familiar_pick),
+            d=len([x for x in final_ids if x not in set(carry) | set(familiar_pick)]),
+            n_total=n_total,
+            tempo=prof.get("tempo"),
+            energy=prof.get("energy"),
+            fr=prof["familiar_ratio"],
+        )
     )
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
