@@ -38,13 +38,16 @@ NOVELTY_KEEP_DAYS = int(ENV("NOVELTY_KEEP_DAYS", "14"))          # lookback wind
 
 
 # Tuning & profile defaults (override via env if you want)
-N_TRACKS         = int(ENV("N_TRACKS", "50"))
-TEMPO_MIN        = float(ENV("TEMPO_MIN", "105"))
-TEMPO_MAX        = float(ENV("TEMPO_MAX", "132"))
-ENERGY_MIN       = float(ENV("ENERGY_MIN", "0.65"))
-ENERGY_MAX       = float(ENV("ENERGY_MAX", "0.85"))
-FAMILIAR_RATIO   = float(ENV("FAMILIAR_RATIO", "0.60"))
-CARRY_FRACTION   = float(ENV("CARRY_FRACTION", "0.20"))
+N_TRACKS         = ENV_INT("N_TRACKS", 50)
+FAMILIAR_RATIO   = ENV_FLOAT("FAMILIAR_RATIO", 0.6)
+TEMPO_MIN        = ENV_FLOAT("TEMPO_MIN", 105.0)
+TEMPO_MAX        = ENV_FLOAT("TEMPO_MAX", 132.0)
+ENERGY_MIN       = ENV_FLOAT("ENERGY_MIN", 0.65)
+ENERGY_MAX       = ENV_FLOAT("ENERGY_MAX", 0.85)
+CARRY_PERCENT    = ENV_FLOAT("CARRY_PERCENT", 0.20)
+REPEAT_CAP       = ENV_FLOAT("REPEAT_CAP_PERCENT", 0.10)
+NOVELTY_DAYS     = ENV_INT("NOVELTY_LOOKBACK_DAYS", 30)
+CARRY_FRACTION = float(os.getenv("CARRY_FRACTION", "0.20"))
 
 # Novelty memory
 STATE_PATH       = ENV("STATE_PATH", "state/seen.json")
@@ -54,6 +57,26 @@ MAX_REPEAT_FRAC  = float(ENV("MAX_REPEAT_FRACTION", "0.05"))
 # Safety caps
 MAX_WRITE_CHUNK  = 100
 AUDIO_FEATURES_CHUNK = 40  # if you enable audio-features again later
+
+
+def ENV(name: str, default: str | None = None) -> str | None:
+    v = os.getenv(name)
+    return v if v not in (None, "") else default
+
+def ENV_INT(name: str, default: int) -> int:
+    v = os.getenv(name)
+    try:
+        return int(v)  # works if v is a proper int string
+    except (TypeError, ValueError):
+        return default
+
+def ENV_FLOAT(name: str, default: float) -> float:
+    v = os.getenv(name)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
 
 # ------------------ Time helpers ------------------
 
