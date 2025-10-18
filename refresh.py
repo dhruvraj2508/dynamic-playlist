@@ -1,556 +1,477 @@
 #!/usr/bin/env python3
-# refresh.py — robust Spotify playlist refresher with novelty + safe seeds
-# - No genre seeds (avoid 404s)
-# - No calls to endpoints that need extra scopes unless available
-# - Always normalize seeds to bare IDs
-# - Novelty memory via state/seen.json (commit this file in your repo)
-# - Replaces playlist items, then tops-up if needed
-# - Prints a compact report at the end
+# -*- coding: utf-8 -*-
 
-import os
-import re
-import sys
-import json
-import time
-import math
-import base64
-import datetime as dt
-from typing import List, Dict, Any, Optional, Iterable
+"""
+Dynamic Spotify playlist refresher (carry + familiar/discovery with novelty guard)
+
+What this script does
+- Auth via Refresh Token (no interactive prompt)
+- Reads the current playlist, carries a fraction forward
+- Pulls your Top Tracks/Artists (if scope allowed), otherwise falls back
+- Builds discovery via /recommendations with tempo/energy window
+- Enforces approx 60/40 Familiar/Discovery (configurable)
+- Avoids unsupported seeds and empty params (prevents 400s)
+- Gracefully handles 403 scopes by skipping those calls (prevents crashes)
+- Replaces items in the SAME playlist
+- Writes a small run report (text) to the workspace (optional)
+
+Environment (set as GitHub Actions “Secrets and variables” → “Variables”, unless secret):
+- SPOTIFY_CLIENT_ID        (secret)
+- SPOTIFY_CLIENT_SECRET    (secret)
+- SPOTIFY_REFRESH_TOKEN    (secret)
+- PLAYLIST_ID              e.g. 7w5J0EdQB2UOE6LrMZK0bq
+- COUNTRY_MARKET           e.g. IN  (optional; default: None)
+- TIMEZONE                 e.g. Asia/Kolkata (optional; default: UTC)
+- N_TRACKS                 e.g. 50  (int; default: 50)
+- CARRY_FRACTION           e.g. 0.20 (float; default: 0.20)
+- FAMILIAR_RATIO           e.g. 0.60 (float; default: 0.60)  # discovery will be 1 - this
+- TEMPO_MIN                e.g. 105 (float; default: 105)
+- TEMPO_MAX                e.g. 132 (float; default: 132)
+- ENERGY_MIN               e.g. 0.65 (float; default: 0.65)
+- ENERGY_MAX               e.g. 0.85 (float; default: 0.85)
+
+Requires:
+  pip install spotipy==2.23.0 requests==2.*
+"""
+
+from __future__ import annotations
+import os, sys, json, math, time, random, typing as T
+from datetime import datetime, timezone
+try:
+    import zoneinfo
+    tz_get = zoneinfo.ZoneInfo
+except Exception:
+    tz_get = None
 
 import requests
+import spotipy
+from spotipy.oauth2 import SpotifyOAuth, SpotifyClientCredentials
+from spotipy.client import Spotify
+from spotipy.exceptions import SpotifyException
 
-# --- robust env readers (handle empty/None gracefully) ---
-def ENV(name: str, default=None):
-    v = os.getenv(name)
-    return default if v is None or v == "" else v
+# ----------------------------
+# Env helpers
+# ----------------------------
+def ENV(name: str, default: str | None = None) -> str | None:
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return default
+    return val
 
 def ENV_INT(name: str, default: int) -> int:
-    v = ENV(name, default)
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return int(default)
     try:
-        return int(v)
-    except (TypeError, ValueError):
+        return int(str(val).strip())
+    except Exception:
         return int(default)
 
 def ENV_FLOAT(name: str, default: float) -> float:
-    v = ENV(name, default)
+    val = os.getenv(name)
+    if val is None or str(val).strip() == "":
+        return float(default)
     try:
-        return float(v)
-    except (TypeError, ValueError):
+        return float(str(val).strip())
+    except Exception:
         return float(default)
 
+# ----------------------------
+# Config from ENV
+# ----------------------------
+CLIENT_ID      = ENV("SPOTIFY_CLIENT_ID")
+CLIENT_SECRET  = ENV("SPOTIFY_CLIENT_SECRET")
+REFRESH_TOKEN  = ENV("SPOTIFY_REFRESH_TOKEN")
+PLAYLIST_ID    = ENV("PLAYLIST_ID")
+MARKET         = ENV("COUNTRY_MARKET", None)
+TZ_NAME        = ENV("TIMEZONE", "UTC")
 
-# ------------------ Env & Defaults ------------------
+N_TRACKS       = ENV_INT("N_TRACKS", 50)
+CARRY_FRACTION = ENV_FLOAT("CARRY_FRACTION", 0.20)     # keep only this; no carry percent var
+FAMILIAR_RATIO = ENV_FLOAT("FAMILIAR_RATIO", 0.60)     # you asked for 60/40
 
-ENV = os.environ.get
+TEMPO_MIN      = ENV_FLOAT("TEMPO_MIN", 105.0)
+TEMPO_MAX      = ENV_FLOAT("TEMPO_MAX", 132.0)
+ENERGY_MIN     = ENV_FLOAT("ENERGY_MIN", 0.65)
+ENERGY_MAX     = ENV_FLOAT("ENERGY_MAX", 0.85)
 
-CLIENT_ID        = ENV("SPOTIFY_CLIENT_ID", "")
-CLIENT_SECRET    = ENV("SPOTIFY_CLIENT_SECRET", "")
-REFRESH_TOKEN    = ENV("SPOTIFY_REFRESH_TOKEN", "")
-PLAYLIST_ID_RAW  = ENV("PLAYLIST_ID", "")
-MARKET           = ENV("COUNTRY_MARKET", "IN")
-TZ_NAME          = ENV("TIMEZONE", "Asia/Kolkata")
-CARRY_RATIO = float(ENV("CARRY_RATIO", "0.10"))         # 10% of current playlist carried into next run
-MAX_REPEAT_FRACTION = float(ENV("MAX_REPEAT_FRACTION", "0.10"))  # ≤10% of playlist may repeat per run
-NOVELTY_LOG_PATH = ENV("NOVELTY_LOG_PATH", "novelty_log.json")   # file in repo tracking recent runs
-NOVELTY_KEEP_DAYS = int(ENV("NOVELTY_KEEP_DAYS", "14"))          # lookback window for repeats
+# Safety clamps
+FAMILIAR_RATIO = min(max(FAMILIAR_RATIO, 0.0), 1.0)
+CARRY_FRACTION = min(max(CARRY_FRACTION, 0.0), 0.9)
+if TEMPO_MIN > TEMPO_MAX: TEMPO_MIN, TEMPO_MAX = TEMPO_MAX, TEMPO_MIN
+if ENERGY_MIN > ENERGY_MAX: ENERGY_MIN, ENERGY_MAX = ENERGY_MAX, ENERGY_MIN
 
+# ----------------------------
+# Small utils
+# ----------------------------
+def now_local_iso() -> str:
+    if TZ_NAME and tz_get:
+        tz = tz_get(TZ_NAME)
+    else:
+        tz = timezone.utc
+    return datetime.now(tz).isoformat()
 
-# Tuning & profile defaults (override via env if you want)
-N_TRACKS         = ENV_INT("N_TRACKS", 50)
-FAMILIAR_RATIO   = ENV_FLOAT("FAMILIAR_RATIO", 0.6)
-TEMPO_MIN        = ENV_FLOAT("TEMPO_MIN", 105.0)
-TEMPO_MAX        = ENV_FLOAT("TEMPO_MAX", 132.0)
-ENERGY_MIN       = ENV_FLOAT("ENERGY_MIN", 0.65)
-ENERGY_MAX       = ENV_FLOAT("ENERGY_MAX", 0.85)
-CARRY_PERCENT    = ENV_FLOAT("CARRY_PERCENT", 0.20)
-REPEAT_CAP       = ENV_FLOAT("REPEAT_CAP_PERCENT", 0.10)
-NOVELTY_DAYS     = ENV_INT("NOVELTY_LOOKBACK_DAYS", 30)
-CARRY_FRACTION   = ENV_FLOAT("CARRY_FRACTION", 0.20)
-
-# Novelty memory
-STATE_PATH       = ENV("STATE_PATH", "state/seen.json")
-SEEN_WINDOW_DAYS = int(ENV("SEEN_WINDOW_DAYS", "30"))
-MAX_REPEAT_FRAC  = float(ENV("MAX_REPEAT_FRACTION", "0.05"))
-
-# Safety caps
-MAX_WRITE_CHUNK  = 100
-AUDIO_FEATURES_CHUNK = 40  # if you enable audio-features again later
-
-
-
-
-# ------------------ Time helpers ------------------
-
-def now_ist_str() -> str:
-    # naive and simple: print local time string relative to Asia/Kolkata
-    # (GitHub Actions machines are UTC; message is informational only)
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(TZ_NAME)
-        return dt.datetime.now(tz).isoformat()
-    except Exception:
-        return dt.datetime.utcnow().isoformat() + "Z"
-
-# ------------------ ID normalization ------------------
-
-ID_RE = re.compile(r'([A-Za-z0-9]{22})')
-
-def to_id(x: Optional[str]) -> Optional[str]:
-    """Return the 22-char Spotify ID from an ID/URI/URL; else None."""
-    if not x:
-        return None
-    m = ID_RE.search(x)
-    return m.group(1) if m else None
-
-def to_ids(xs: Iterable[str], limit: Optional[int] = None) -> List[str]:
+def uniq(seq: T.Iterable[T.Any]) -> list:
+    """Stable unique preserving order, ignoring falsy ids."""
+    seen = set()
     out = []
-    for x in xs or []:
-        xid = to_id(x)
-        if xid:
-            out.append(xid)
-    if limit is not None:
-        return out[:limit]
+    for x in seq:
+        if not x: 
+            continue
+        if x not in seen:
+            out.append(x)
+            seen.add(x)
     return out
 
-PLAYLIST_ID = to_id(PLAYLIST_ID_RAW) or PLAYLIST_ID_RAW
+def chunks(lst: list, n: int) -> T.Iterable[list]:
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
-# ------------------ Auth with refresh token ------------------
+def log_warn(msg: str):
+    print(f"[WARN] {msg}", file=sys.stderr)
 
-def get_access_token_from_refresh() -> str:
+# ----------------------------
+# Auth via Refresh Token (no browser)
+# ----------------------------
+def get_token_via_refresh(client_id: str, client_secret: str, refresh_token: str) -> dict:
     token_url = "https://accounts.spotify.com/api/token"
-    auth_b64 = base64.b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode()
     data = {
         "grant_type": "refresh_token",
-        "refresh_token": REFRESH_TOKEN,
+        "refresh_token": refresh_token,
     }
-    headers = {
-        "Authorization": f"Basic {auth_b64}",
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    r = requests.post(token_url, data=data, headers=headers, timeout=20)
+    auth = (client_id, client_secret)
+    r = requests.post(token_url, data=data, auth=auth, timeout=30)
     r.raise_for_status()
-    js = r.json()
-    return js["access_token"]
+    return r.json()
 
-class SPWrap:
-    """Tiny wrapper that refreshes token on 401 and retries once."""
-    def __init__(self):
-        self.access_token = get_access_token_from_refresh()
-        self.sp = Spotify(auth=self.access_token)
+def sp_client() -> Spotify:
+    if not (CLIENT_ID and CLIENT_SECRET and REFRESH_TOKEN):
+        raise SystemExit("Missing CLIENT_ID/CLIENT_SECRET/REFRESH_TOKEN")
 
-    def _refresh(self):
-        self.access_token = get_access_token_from_refresh()
-        self.sp = Spotify(auth=self.access_token)
+    try:
+        token = get_token_via_refresh(CLIENT_ID, CLIENT_SECRET, REFRESH_TOKEN)
+        access_token = token.get("access_token")
+        if not access_token:
+            raise RuntimeError("Failed to obtain access token from refresh grant.")
+        sp = spotipy.Spotify(auth=access_token)
+        return sp
+    except Exception as e:
+        raise SystemExit(f"Auth failed: {e}")
 
-    def call(self, fn, *args, **kwargs):
-        try:
-            return fn(*args, **kwargs)
-        except SpotifyException as e:
-            # 401 -> refresh and retry once
-            if e.http_status == 401:
-                self._refresh()
-                return fn(*args, **kwargs)
-            raise
+# ----------------------------
+# Spotify helpers (safe wrappers)
+# ----------------------------
+def safe_call(fn: T.Callable, *args, **kwargs):
+    """Call Spotipy fn; return {} or [] on error and log a warning."""
+    try:
+        return fn(*args, **kwargs)
+    except SpotifyException as e:
+        log_warn(f"{fn.__name__} failed: http status: {e.http_status}, code: {e.code} - {e.msg}")
+        return {} if isinstance({}, type({})) else []
+    except requests.HTTPError as e:
+        log_warn(f"{fn.__name__} failed: {e}")
+        return {} if isinstance({}, type({})) else []
+    except Exception as e:
+        log_warn(f"{fn.__name__} failed: {e}")
+        return {} if isinstance({}, type({})) else []
 
-# ------------------ Spotify helpers ------------------
+def current_user_id(sp: Spotify) -> str | None:
+    me = safe_call(sp.me)
+    if isinstance(me, dict):
+        return me.get("id")
+    return None
 
-def playlist_track_ids(sp: SPWrap, playlist_id: str) -> List[str]:
-    ids = []
+def playlist_track_ids(sp: Spotify, playlist_id: str, limit: int | None = None) -> list[str]:
+    """Read track IDs from a playlist; returns IDs (not URIs)."""
+    out = []
     offset = 0
     while True:
-        res = sp.call(
-            sp.sp.playlist_items,
-            playlist_id,
-            fields="items(track(id,uri)),total,next",
-            additional_types=("track",),
-            limit=100,
-            offset=offset
-        )
-        for it in res.get("items", []):
-            tr = it.get("track") or {}
+        resp = safe_call(sp.playlist_items, playlist_id, limit=100, offset=offset, additional_types=("track",))
+        if not resp or not isinstance(resp, dict):
+            break
+        items = resp.get("items", [])
+        for it in items:
+            tr = (it or {}).get("track") or {}
             tid = tr.get("id")
             if tid:
-                ids.append(tid)
-        if res.get("next"):
+                out.append(tid)
+                if limit and len(out) >= limit:
+                    return out[:limit]
+        if resp.get("next"):
             offset += 100
         else:
             break
-    return ids
-
-def user_top_tracks(sp: SPWrap, time_range: str) -> List[str]:
-    try:
-        res = sp.call(sp.sp.current_user_top_tracks, limit=50, time_range=time_range)
-        return [t["id"] for t in res.get("items", []) if t and t.get("id")]
-    except Exception as e:
-        print(f"[WARN] top_tracks({time_range}) failed: {e}")
-        return []
-
-def playlist_replace_all(sp: SPWrap, playlist_id: str, uris: List[str]):
-    # Replace first 100, then add the rest in chunks
-    first = uris[:MAX_WRITE_CHUNK]
-    sp.call(sp.sp.playlist_replace_items, playlist_id, first)
-    rest = uris[MAX_WRITE_CHUNK:]
-    for i in range(0, len(rest), MAX_WRITE_CHUNK):
-        sp.call(sp.sp.playlist_add_items, playlist_id, rest[i:i+MAX_WRITE_CHUNK])
-
-def playlist_count(sp: SPWrap, playlist_id: str) -> int:
-    try:
-        meta = sp.call(sp.sp.playlist_items, playlist_id, fields="total", limit=1)
-        return int(meta.get("total", 0))
-    except Exception:
-        return 0
-
-import json, datetime, os
-from datetime import timezone, timedelta
-
-def _today_iso_tz(tz_str):
-    # re-use your TIMEZONE if you already have a helper; otherwise keep this simple UTC date
-    return datetime.datetime.now(timezone.utc).date().isoformat()
-
-def load_novelty_log(path):
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict) and "runs" in data and isinstance(data["runs"], list):
-                return data
-    except Exception:
-        pass
-    return {"runs": []}
-
-def prune_novelty_log(log, keep_days=14):
-    cutoff = datetime.datetime.now(timezone.utc) - timedelta(days=keep_days)
-    kept = []
-    for r in log["runs"]:
-        try:
-            ts = datetime.datetime.fromisoformat(r.get("ts"))
-        except Exception:
-            ts = None
-        if ts is None or ts >= cutoff:
-            kept.append(r)
-    log["runs"] = kept
-    return log
-
-def save_novelty_log(path, log):
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(log, f, indent=2, ensure_ascii=False)
-
-def recent_track_ids(log):
-    ids = set()
-    for r in log.get("runs", []):
-        for tid in r.get("tracks", []):
-            if tid:
-                ids.add(tid)
-    return ids
-
-def cap_repeats(prev_ids, desired_ids, n_total, max_repeat_fraction):
-    """
-    Ensure at most floor(n_total * max_repeat_fraction) items overlap with prev_ids.
-    We keep items in order and drop overflow; caller can backfill with new picks.
-    """
-    max_repeats = max(0, int(n_total * max_repeat_fraction))
-    out = []
-    repeats_kept = 0
-    for tid in desired_ids:
-        if tid in prev_ids:
-            if repeats_kept < max_repeats:
-                out.append(tid)
-                repeats_kept += 1
-            else:
-                # skip this repeated one; caller should later fill the gap with novel picks
-                continue
-        else:
-            out.append(tid)
-    return out, max_repeats, repeats_kept
-
-
-# ------------------ Recommendations (seed-safe) ------------------
-
-def safe_recommendations(
-    sp: SPWrap,
-    *,
-    seed_tracks: Optional[List[str]] = None,
-    seed_artists: Optional[List[str]] = None,
-    min_energy: Optional[float] = None,
-    max_energy: Optional[float] = None,
-    target_energy: Optional[float] = None,
-    min_tempo: Optional[float] = None,
-    max_tempo: Optional[float] = None,
-    target_tempo: Optional[float] = None,
-    limit: int = 50,
-) -> List[str]:
-    st = to_ids(seed_tracks or [], limit=5)
-    sa = to_ids(seed_artists or [], limit=5)
-
-    params: Dict[str, Any] = {"limit": limit}
-    if st:
-        params["seed_tracks"] = ",".join(st)
-    elif sa:
-        params["seed_artists"] = ",".join(sa)
-    else:
-        # No seeds: do not call this endpoint
-        return []
-
-    # Only add constraint keys that have values
-    if min_energy is not None:  params["min_energy"] = min_energy
-    if max_energy is not None:  params["max_energy"] = max_energy
-    if target_energy is not None: params["target_energy"] = target_energy
-    if min_tempo is not None:   params["min_tempo"] = min_tempo
-    if max_tempo is not None:   params["max_tempo"] = max_tempo
-    if target_tempo is not None: params["target_tempo"] = target_tempo
-
-    try:
-        rec = sp.call(sp.sp.recommendations, **params)
-        return [t["id"] for t in rec.get("tracks", []) if t and t.get("id")]
-    except Exception as e:
-        print(f"[WARN] recommendations failed: {e}")
-        return []
-
-# ------------------ Novelty memory ------------------
-
-def load_state(path: str) -> Dict[str, Any]:
-    if not os.path.exists(path):
-        return {"runs": []}
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return {"runs": []}
-
-def save_state(path: str, state: Dict[str, Any]):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(state, f, ensure_ascii=False, indent=2)
-
-def prune_state(state: Dict[str, Any], days: int) -> Dict[str, Any]:
-    if "runs" not in state:
-        state["runs"] = []
-        return state
-    cutoff = dt.datetime.utcnow() - dt.timedelta(days=days)
-    kept = []
-    for run in state["runs"]:
-        ts = run.get("ts")
-        try:
-            when = dt.datetime.fromisoformat(ts.replace("Z","")) if ts else None
-        except Exception:
-            when = None
-        if when and when > cutoff:
-            kept.append(run)
-    state["runs"] = kept
-    return state
-
-def seen_recent_set(state: Dict[str, Any]) -> set:
-    s = set()
-    for run in state.get("runs", []):
-        for tid in run.get("tracks", []):
-            if tid:
-                s.add(tid)
-    return s
-
-def record_run(state: Dict[str, Any], track_ids: List[str]):
-    state.setdefault("runs", [])
-    state["runs"].append({
-        "ts": dt.datetime.utcnow().isoformat() + "Z",
-        "tracks": list(track_ids),
-        "n": len(track_ids),
-    })
-
-# ------------------ Profile (time-of-day window) ------------------
-
-def current_profile() -> Dict[str, Any]:
-    # You can tweak these windows later; they’re what you asked earlier:
-    # 10–13 high-energy; 13–16 mellow; 16–20 focus high-energy; otherwise default.
-    try:
-        from zoneinfo import ZoneInfo
-        tz = ZoneInfo(TZ_NAME)
-        now = dt.datetime.now(tz)
-        hour = now.hour
-    except Exception:
-        hour = dt.datetime.utcnow().hour
-
-    if 10 <= hour < 13:
-        tempo = (105, 132)
-        energy = (0.65, 0.85)
-        fam = 0.60
-    elif 13 <= hour < 16:
-        tempo = (85, 110)
-        energy = (0.40, 0.65)
-        fam = 0.60
-    elif 16 <= hour < 20:
-        tempo = (100, 130)
-        energy = (0.60, 0.85)
-        fam = 0.60
-    else:
-        tempo = (TEMPO_MIN, TEMPO_MAX)
-        energy = (ENERGY_MIN, ENERGY_MAX)
-        fam = FAMILIAR_RATIO
-
-    return {
-        "n_tracks": N_TRACKS,
-        "tempo": tempo,
-        "energy": energy,
-        "familiar_ratio": fam,
-    }
-
-# ------------------ Assembling the new playlist ------------------
-
-def uniq(seq: Iterable[str]) -> List[str]:
-    s = set()
-    out = []
-    for x in seq:
-        if x and x not in s:
-            s.add(x)
-            out.append(x)
     return out
 
-def clamp_novelty(candidates: List[str], seen_recent: set, n_total: int, max_repeat_frac: float) -> List[str]:
-    """Ensure repeats across recent runs don't exceed max_repeat_frac of n_total."""
-    max_repeats_allowed = int(math.floor(n_total * max_repeat_frac))
-    fresh = [t for t in candidates if t not in seen_recent]
-    repeats = [t for t in candidates if t in seen_recent]
-    # allow only some repeats
-    repeats = repeats[:max_repeats_allowed]
-    return uniq(fresh + repeats)
+# ----------------------------
+# Familiar pool (with graceful scope fallback)
+# ----------------------------
+def user_top_tracks(sp: Spotify, time_range: str = "medium_term", limit: int = 50) -> list[str]:
+    """Return list of track IDs, handles missing scope by returning []."""
+    try:
+        resp = sp.current_user_top_tracks(limit=limit, time_range=time_range)
+        items = (resp or {}).get("items", [])
+        return [ (t or {}).get("id") for t in items if (t or {}).get("id") ]
+    except SpotifyException as e:
+        # 403 insufficient scope → fallback to []
+        log_warn(f"current_user_top_tracks failed: http status: {e.http_status}, code: {e.code} - {e.msg}")
+        return []
+    except Exception as e:
+        log_warn(f"current_user_top_tracks failed: {e}")
+        return []
 
-def build_discovery(sp: SPWrap, seeds_tracks: List[str], seeds_artists: List[str], prof: Dict[str, Any], needed: int) -> List[str]:
-    # Prefer track seeds; if empty, use artist seeds
-    target_energy = (prof["energy"][0] + prof["energy"][1]) / 2.0
-    target_tempo  = (prof["tempo"][0] + prof["tempo"][1]) / 2.0
+def user_top_artists(sp: Spotify, time_range: str = "medium_term", limit: int = 50) -> list[str]:
+    """Return list of artist IDs, handles missing scope by returning []."""
+    try:
+        resp = sp.current_user_top_artists(limit=limit, time_range=time_range)
+        items = (resp or {}).get("items", [])
+        return [ (a or {}).get("id") for a in items if (a or {}).get("id") ]
+    except SpotifyException as e:
+        log_warn(f"current_user_top_artists failed: http status: {e.http_status}, code: {e.code} - {e.msg}")
+        return []
+    except Exception as e:
+        log_warn(f"current_user_top_artists failed: {e}")
+        return []
 
-    pool = []
-    if seeds_tracks:
-        pool += safe_recommendations(
-            sp,
-            seed_tracks=seeds_tracks[:5],
-            min_energy=prof["energy"][0], max_energy=prof["energy"][1], target_energy=target_energy,
-            min_tempo=prof["tempo"][0],  max_tempo=prof["tempo"][1],  target_tempo=target_tempo,
-            limit=min(50, max(needed, 20)),
-        )
-    if not pool and seeds_artists:
-        pool += safe_recommendations(
-            sp,
-            seed_artists=seeds_artists[:5],
-            min_energy=prof["energy"][0], max_energy=prof["energy"][1], target_energy=target_energy,
-            min_tempo=prof["tempo"][0],  max_tempo=prof["tempo"][1],  target_tempo=target_tempo,
-            limit=min(50, max(needed, 20)),
-        )
-
-    return uniq(pool)
-
-# --- Spotify client factory (put ABOVE main()) ---
-import spotipy
-from spotipy.oauth2 import SpotifyOAuth
-
-SPOTIFY_CLIENT_ID     = ENV("SPOTIFY_CLIENT_ID")
-SPOTIFY_CLIENT_SECRET = ENV("SPOTIFY_CLIENT_SECRET")
-SPOTIFY_REFRESH_TOKEN = ENV("SPOTIFY_REFRESH_TOKEN")
-REDIRECT_URI          = ENV("REDIRECT_URI", "https://example.com/callback")
-
-# include all scopes you actually use (add/remove as needed)
-SCOPES = "playlist-read-private playlist-modify-private playlist-modify-public user-top-read user-library-read user-read-recently-played"
-
-def sp_client() -> spotipy.Spotify:
+# ----------------------------
+# Recommendations (discovery) — robust seed handling
+# ----------------------------
+def recommendations(
+    sp: Spotify,
+    *,
+    seed_artists: list[str] | None,
+    seed_tracks: list[str] | None,
+    limit: int,
+    tempo_min: float,
+    tempo_max: float,
+    energy_min: float,
+    energy_max: float,
+    market: str | None,
+) -> list[str]:
     """
-    Creates a Spotipy client by refreshing the access token on every run.
-    Works in GitHub Actions (no local cache).
+    Wraps sp.recommendations with careful seed selection and prevents empty/invalid params.
+    Returns a list of track IDs.
     """
-    if not SPOTIFY_CLIENT_ID or not SPOTIFY_CLIENT_SECRET or not SPOTIFY_REFRESH_TOKEN:
-        raise RuntimeError("Missing Spotify creds: ensure SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, SPOTIFY_REFRESH_TOKEN are set.")
+    seed_artists = [s for s in (seed_artists or []) if s]
+    seed_tracks  = [s for s in (seed_tracks or []) if s]
 
-    oauth = SpotifyOAuth(
-        client_id=SPOTIFY_CLIENT_ID,
-        client_secret=SPOTIFY_CLIENT_SECRET,
-        redirect_uri=REDIRECT_URI,
-        scope=SCOPES,
-        open_browser=False,
-        cache_path=None,          # no local cache in Actions
-        requests_timeout=20,
-    )
-    token_info = oauth.refresh_access_token(SPOTIFY_REFRESH_TOKEN)
-    access_token = token_info["access_token"]
-    return spotipy.Spotify(auth=access_token)
+    # Spotify allows up to 5 combined seeds. Use at least 1 valid seed when possible.
+    seeds_used = False
+    params: dict = {"limit": max(1, min(100, limit))}
+    if seed_artists:
+        params["seed_artists"] = seed_artists[: min(5, len(seed_artists))]
+        seeds_used = True
+    if seed_tracks:
+        # If artists already used, fill remaining seed slots with tracks
+        remaining = 5 - len(params.get("seed_artists", []))
+        if remaining > 0:
+            params["seed_tracks"] = seed_tracks[:remaining]
+            seeds_used = True
 
+    # If we somehow have no seeds (scope issues), we still call recommendations with target filters.
+    # Some deployments/regions return 404 with only target params. We progressively relax if that happens.
+    params["min_energy"]   = energy_min
+    params["max_energy"]   = energy_max
+    params["target_energy"]= (energy_min + energy_max) / 2.0
+    params["min_tempo"]    = tempo_min
+    params["max_tempo"]    = tempo_max
+    params["target_tempo"] = (tempo_min + tempo_max) / 2.0
+    if market:
+        params["market"] = market
 
-# ---------- Main ----------
-def main():
+    # Try up to 5 passes, relaxing constraints if strictly no seeds and we hit 404
+    out_ids: list[str] = []
+    for attempt in range(5):
+        try:
+            rec = sp.recommendations(**params)
+            tracks = (rec or {}).get("tracks", []) or []
+            out_ids = [ (t or {}).get("id") for t in tracks if (t or {}).get("id") ]
+            if out_ids:
+                break
+            # Otherwise, slightly broaden
+            params["min_energy"] = max(0.0, params["min_energy"] - 0.03)
+            params["max_energy"] = min(1.0, params["max_energy"] + 0.03)
+            params["min_tempo"]  = max(50.0, params["min_tempo"] - 6.0)
+            params["max_tempo"]  = min(220.0, params["max_tempo"] + 6.0)
+        except SpotifyException as e:
+            log_warn(f"recommendations failed: http status: {e.http_status}, code: {e.code} - {e.msg}")
+            # Relax on 404 only; otherwise just break
+            if e.http_status == 404:
+                params["min_energy"] = max(0.0, params["min_energy"] - 0.05)
+                params["max_energy"] = min(1.0, params["max_energy"] + 0.05)
+                params["min_tempo"]  = max(40.0, params["min_tempo"] - 12.0)
+                params["max_tempo"]  = min(240.0, params["max_tempo"] + 12.0)
+                continue
+            else:
+                break
+        except Exception as e:
+            log_warn(f"recommendations unexpected error: {e}")
+            break
+
+    return uniq(out_ids)
+
+# ----------------------------
+# Novelty store (optional lightweight)
+# ----------------------------
+NOVELTY_FILE = "novelty_history.json"
+def novelty_load() -> set[str]:
+    try:
+        with open(NOVELTY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            return set([x for x in data if isinstance(x, str)])
+        return set()
+    except Exception:
+        return set()
+
+def novelty_save(ids: list[str], max_keep: int = 2000) -> None:
+    prev = []
+    try:
+        with open(NOVELTY_FILE, "r", encoding="utf-8") as f:
+            prev = json.load(f)
+            if not isinstance(prev, list):
+                prev = []
+    except Exception:
+        prev = []
+    merged = uniq(prev + ids)
+    if len(merged) > max_keep:
+        merged = merged[-max_keep:]
+    try:
+        with open(NOVELTY_FILE, "w", encoding="utf-8") as f:
+            json.dump(merged, f)
+    except Exception:
+        pass
+
+# ----------------------------
+# Main flow
+# ----------------------------
+def main() -> int:
+    print(f"Starting refresh at {datetime.utcnow().replace(tzinfo=timezone.utc).isoformat()}Z")
+
     sp = sp_client()
-    prof = current_profile()
+    if not PLAYLIST_ID:
+        raise SystemExit("PLAYLIST_ID is required.")
 
-    # force the 60/40 split you asked for (override whatever profile says)
-    prof["familiar_ratio"] = 0.60
-    n_total = int(prof.get("n_tracks", 50))
+    # Read current playlist and compute carry
+    current_ids = playlist_track_ids(sp, PLAYLIST_ID) or []
+    carry_n = int(math.floor(N_TRACKS * CARRY_FRACTION))
+    carry_ids = current_ids[:carry_n] if carry_n > 0 else []
 
-    # 1) Carry over up to 20% from the current playlist (keeps a little continuity)
-    current_ids = read_playlist_track_ids(sp, PLAYLIST_ID) or []
-    carry_n = max(0, int(math.floor(n_total * 0.20)))
-    carry = current_ids[:carry_n]
+    # Familiar pool (top tracks if possible, else fallback to current)
+    top_short = user_top_tracks(sp, "short_term", 50)
+    top_med   = user_top_tracks(sp, "medium_term", 50)
+    familiar_pool = uniq(top_short + top_med)
+    if not familiar_pool:
+        # Fallback: use whatever is in the playlist as "familiar"
+        familiar_pool = uniq(current_ids)
 
-    # 2) Build the familiar pool from your Top Tracks (short + medium term)
-    top_short = safe_call(sp.current_user_top_tracks, limit=50, time_range="short_term") or {}
-    top_med   = safe_call(sp.current_user_top_tracks, limit=50, time_range="medium_term") or {}
-    top_short_items = top_short.get("items", []) if isinstance(top_short, dict) else []
-    top_med_items   = top_med.get("items", []) if isinstance(top_med, dict) else []
-    familiar_pool = uniq([t.get("id") for t in (top_short_items + top_med_items) if t and t.get("id")])
+    # Familiar pick (avoid duplicating carry)
+    familiar_target = int(round(N_TRACKS * FAMILIAR_RATIO))
+    familiar_pick = [t for t in familiar_pool if t not in carry_ids][:familiar_target]
 
-    # 3) Pick familiar (excluding anything we already carry)
-    familiar_target = max(0, int(math.floor(n_total * prof["familiar_ratio"])))
-    familiar_pick = [t for t in familiar_pool if t not in carry][:familiar_target]
+    # Seeds for discovery: prefer user top artists/tracks (if present), else use familiar pool
+    seed_art = user_top_artists(sp, "medium_term", 50)
+    if not seed_art:
+        # derive artists from familiar tracks metadata (cheaply via tracks endpoint)
+        # If this fails (rate/403), we’ll just leave seed_art empty
+        try:
+            meta = []
+            for batch in chunks(familiar_pool[:50], 50):
+                resp = sp.tracks(batch, market=MARKET) if MARKET else sp.tracks(batch)
+                meta.extend((resp or {}).get("tracks", []) or [])
+            seed_art = uniq([ ((t or {}).get("artists") or [{}])[0].get("id") for t in meta if t ])
+        except Exception as e:
+            log_warn(f"seed artist derivation failed: {e}")
+            seed_art = []
 
-    # 4) Discovery pool (exclude carry + familiar + the rest of current to avoid “re-adds”)
-    avoid = set(carry) | set(familiar_pick) | set(current_ids)
-    discovery_pool = build_discovery(sp, prof, MARKET, avoid_ids=avoid) or []
+    seed_trk = familiar_pool[:50]
 
-    # 5) Fill discovery slice
-    remaining = max(0, n_total - len(carry) - len(familiar_pick))
-    discovery_ids = [d for d in discovery_pool if d not in avoid][:remaining]
+    # Discovery pool via /recommendations (no genres to avoid 404s you were seeing)
+    discovery_needed = max(0, N_TRACKS - len(carry_ids) - len(familiar_pick))
+    discovery_pool: list[str] = []
+    if discovery_needed > 0:
+        # Try a few passes with shuffled seeds to get variety
+        rand_art = seed_art[:]
+        rand_trk = seed_trk[:]
+        random.shuffle(rand_art)
+        random.shuffle(rand_trk)
 
-    # 6) If discovery ran short, top up so we ALWAYS hit n_total
-    if len(discovery_ids) < remaining:
-        # first, try to top up with more familiar (still excluding already chosen)
-        need = remaining - len(discovery_ids)
-        familiar_topup = [t for t in familiar_pool
-                          if t not in carry and t not in familiar_pick and t not in discovery_ids][:need]
-        discovery_ids.extend(familiar_topup)
+        tries = max(3, min(6, (discovery_needed // 10) + 3))
+        for i in range(tries):
+            use_art = rand_art[i*3:(i+1)*3]
+            use_trk = rand_trk[i*2:(i+1)*2]
+            rec_ids = recommendations(
+                sp,
+                seed_artists=use_art,
+                seed_tracks=use_trk,
+                limit=min(50, max(10, discovery_needed*2)),
+                tempo_min=TEMPO_MIN, tempo_max=TEMPO_MAX,
+                energy_min=ENERGY_MIN, energy_max=ENERGY_MAX,
+                market=MARKET
+            )
+            discovery_pool.extend(rec_ids)
+            if len(uniq(discovery_pool)) >= discovery_needed * 2:
+                break
 
-    if len(carry) + len(familiar_pick) + len(discovery_ids) < n_total:
-        # absolute last resort: take from current playlist leftovers (keeps length stable)
-        need = n_total - (len(carry) + len(familiar_pick) + len(discovery_ids))
-        leftovers = [t for t in current_ids if t not in carry and t not in familiar_pick and t not in discovery_ids][:need]
-        discovery_ids.extend(leftovers)
+    # Novelty: avoid repeats across runs for discovery portion only (not familiar/carry)
+    novelty_seen = novelty_load()
+    discovery_pool = [d for d in uniq(discovery_pool) if d not in novelty_seen and d not in carry_ids and d not in familiar_pick]
+    discovery_pick = discovery_pool[:discovery_needed]
 
-    # 7) Final assembly (dedup + truncate to target)
-    final_ids = uniq(carry + familiar_pick + discovery_ids)[:n_total]
+    # If discovery too small, backfill with more familiar (but still avoiding carry) or random recs without seeds
+    if len(discovery_pick) < discovery_needed:
+        deficit = discovery_needed - len(discovery_pick)
+        backfill = [t for t in familiar_pool if t not in carry_ids and t not in familiar_pick and t not in discovery_pick]
+        discovery_pick += backfill[:deficit]
+
+    # Final stitch
+    final_ids = uniq(carry_ids + familiar_pick + discovery_pick)[:N_TRACKS]
     final_uris = [f"spotify:track:{tid}" for tid in final_ids]
 
-    # 8) Write back to the SAME playlist (handle >100 in safe chunks)
-    # Replace first batch (up to 100)
-    first_batch = final_uris[:100]
-    safe_call(sp.playlist_replace_items, PLAYLIST_ID, first_batch)
+    # Write to the SAME playlist
+    try:
+        sp.playlist_replace_items(PLAYLIST_ID, final_uris[:100])
+        # If N_TRACKS > 100, append remaining
+        remaining = final_uris[100:]
+        pos = 0
+        while remaining:
+            batch = remaining[:100]
+            remaining = remaining[100:]
+            sp.playlist_add_items(PLAYLIST_ID, batch, position=pos+len(final_uris[:100])+pos)
+            pos += len(batch)
+    except SpotifyException as e:
+        raise SystemExit(f"Failed to write playlist: http status {e.http_status} code {e.code} - {e.msg}")
 
-    # Append any remaining in 100-sized chunks
-    idx = 100
-    while idx < len(final_uris):
-        safe_call(sp.playlist_add_items, PLAYLIST_ID, final_uris[idx:idx+100])
-        idx += 100
+    # Save novelty history for future runs (only discovery portion)
+    novelty_save(discovery_pick)
 
-    # 9) Log a clear summary so you can verify splits & lengths in the Actions logs
-    print(
-        "OK: wrote {n} tracks to {pl} at {ts}. "
-        "Breakdown: carry={c}, familiar={f}, discovery={d}. "
-        "Window={{'n_tracks': {n_total}, 'tempo': {tempo}, 'energy': {energy}, 'familiar_ratio': {fr}}}".format(
-            n=len(final_uris),
-            pl=PLAYLIST_ID,
-            ts=now_ist(),
-            c=len(carry),
-            f=len(familiar_pick),
-            d=len([x for x in final_ids if x not in set(carry) | set(familiar_pick)]),
-            n_total=n_total,
-            tempo=prof.get("tempo"),
-            energy=prof.get("energy"),
-            fr=prof["familiar_ratio"],
-        )
-    )
+    # Lightweight report
+    window = {
+        "tempo": (TEMPO_MIN, TEMPO_MAX),
+        "energy": (ENERGY_MIN, ENERGY_MAX),
+        "familiar_ratio": FAMILIAR_RATIO,
+        "carry_fraction": CARRY_FRACTION,
+        "market": MARKET,
+        "n_tracks": N_TRACKS,
+    }
+    print(f"OK: wrote {len(final_uris)} tracks to *** at {now_local_iso()}. Window={window}")
+
+    # Optional: write a tiny text file so you can open it from Actions artifacts/logs
+    try:
+        with open("run_report.txt", "w", encoding="utf-8") as f:
+            f.write(f"Run at {now_local_iso()}\n")
+            f.write(f"Final count: {len(final_uris)}\n")
+            f.write(json.dumps(window, indent=2))
+            f.write("\nFirst 10 IDs:\n")
+            f.write("\n".join(final_ids[:10]))
+            f.write("\n")
+    except Exception:
+        pass
+
     return 0
 
-
+# ----------------------------
+# Entry
+# ----------------------------
 if __name__ == "__main__":
     raise SystemExit(main())
