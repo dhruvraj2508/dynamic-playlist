@@ -47,7 +47,7 @@ ENERGY_MAX       = ENV_FLOAT("ENERGY_MAX", 0.85)
 CARRY_PERCENT    = ENV_FLOAT("CARRY_PERCENT", 0.20)
 REPEAT_CAP       = ENV_FLOAT("REPEAT_CAP_PERCENT", 0.10)
 NOVELTY_DAYS     = ENV_INT("NOVELTY_LOOKBACK_DAYS", 30)
-CARRY_FRACTION = float(os.getenv("CARRY_FRACTION", "0.20"))
+CARRY_FRACTION   = ENV_FLOAT("CARRY_FRACTION", 0.20)
 
 # Novelty memory
 STATE_PATH       = ENV("STATE_PATH", "state/seen.json")
@@ -59,23 +59,25 @@ MAX_WRITE_CHUNK  = 100
 AUDIO_FEATURES_CHUNK = 40  # if you enable audio-features again later
 
 
-def ENV(name: str, default: str | None = None) -> str | None:
+
+# --- robust env readers (handle empty/None gracefully) ---
+def ENV(name: str, default=None):
     v = os.getenv(name)
-    return v if v not in (None, "") else default
+    return default if v is None or v == "" else v
 
 def ENV_INT(name: str, default: int) -> int:
-    v = os.getenv(name)
+    v = ENV(name, default)
     try:
-        return int(v)  # works if v is a proper int string
+        return int(v)
     except (TypeError, ValueError):
-        return default
+        return int(default)
 
 def ENV_FLOAT(name: str, default: float) -> float:
-    v = os.getenv(name)
+    v = ENV(name, default)
     try:
         return float(v)
     except (TypeError, ValueError):
-        return default
+        return float(default)
 
 
 # ------------------ Time helpers ------------------
