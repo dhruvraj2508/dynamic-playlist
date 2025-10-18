@@ -1,67 +1,93 @@
-name: Refresh Spotify Playlist
+name: Dynamic Playlist Refresh
 
 on:
-  # Manual trigger with optional inputs
+  # Nightly (08:00 India) — change as you like
+  schedule:
+    - cron: "30 2 * * *"
+  # Manual trigger with optional overrides
   workflow_dispatch:
     inputs:
-      dry_run:
-        description: "Don't write to Spotify (preview only)"
-        required: false
-        default: "false"
-        type: choice
-        options: ["false", "true"]
-      force_profile:
-        description: "Override time-of-day window (morning|afternoon|evening|focus)"
-        required: false
-        default: ""
-        type: choice
-        options: ["", "morning", "afternoon", "evening", "focus"]
       n_tracks:
-        description: "Override track count (leave blank to use script default)"
-        required: false
-        default: ""
-        type: string
-
-  # Scheduler (runs every hour). Adjust as you like.
-  schedule:
-    - cron: "0 * * * *"
+        description: "Total tracks to write"
+        type: number
+        default: 50
+        required: true
+      familiar_ratio:
+        description: "Familiar vs Discovery (0.0–1.0). e.g., 0.6 = 60% familiar"
+        type: number
+        default: 0.6
+        required: true
+      carry_frac:
+        description: "Carry-over fraction from previous run (0.0–0.3 recommended)"
+        type: number
+        default: 0.2
+        required: true
+      tempo_min:
+        description: "Min BPM"
+        type: number
+        default: 105
+        required: true
+      tempo_max:
+        description: "Max BPM"
+        type: number
+        default: 132
+        required: true
+      energy_min:
+        description: "Min energy"
+        type: number
+        default: 0.65
+        required: true
+      energy_max:
+        description: "Max energy"
+        type: number
+        default: 0.85
+        required: true
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
-  group: refresh-spotify-playlist
+  group: dynamic-playlist-refresh
   cancel-in-progress: false
 
 jobs:
   refresh:
     runs-on: ubuntu-latest
-
+    timeout-minutes: 15
     env:
-      # --- Required secrets (set these in your repo Settings → Secrets and variables → Actions → Secrets) ---
+      # -------- Required Spotify secrets (set these in Settings → Secrets and variables → Actions → Secrets) --------
       SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
       SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
       SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
       PLAYLIST_ID: ${{ secrets.PLAYLIST_ID }}
-      N_TRACKS: ${{ vars.N_TRACKS }}
-      CARRY_FRACTION: ${{ vars.CARRY_FRACTION }}
 
+      # -------- Optional Spotify/env settings (OK as repo-level Variables) --------
+      COUNTRY_MARKET: ${{ vars.COUNTRY_MARKET }}         # e.g. IN, US
+      TIMEZONE: ${{ vars.TIMEZONE }}                     # e.g. Asia/Kolkata
 
-      # --- Optional repository "Variables" (Settings → Secrets and variables → Actions → Variables) ---
-      # If not set, your refresh.py should fall back to sane defaults.
-      COUNTRY_MARKET: ${{ vars.COUNTRY_MARKET }}        # e.g. IN or US
-      TIMEZONE: ${{ vars.TIMEZONE }}                    # e.g. Asia/Kolkata
-      NOVELTY_DAYS: ${{ vars.NOVELTY_DAYS }}            # e.g. 30
-      NOVELTY_REPEAT_FRACTION: ${{ vars.NOVELTY_REPEAT_FRACTION }}  # e.g. 0.10
-      FAMILIAR_RATIO: ${{ vars.FAMILIAR_RATIO }}        # e.g. 0.60 (for 60/40)
+      # -------- Persistent novelty store (Gist) to survive ephemeral workspace --------
+      # Create a classic PAT with 'gist' scope and store as secret GH_GIST_TOKEN.
+      # Create an empty secret Gist (or let the script create on first run) and set GH_GIST_ID in repo Variables.
+      GH_GIST_ID: ${{ vars.GH_GIST_ID }}
+      GH_GIST_TOKEN: ${{ secrets.GH_GIST_TOKEN }}
 
-      # Inputs from workflow_dispatch forwarded as env (script should read these if present)
-      INPUT_DRY_RUN: ${{ github.event.inputs.dry_run }}
-      INPUT_FORCE_PROFILE: ${{ github.event.inputs.force_profile }}
-      INPUT_N_TRACKS: ${{ github.event.inputs.n_tracks }}
+      # -------- Optional discovery sources (comma-separated IDs); leave blank if unused --------
+      SEED_PLAYLIST_IDS: ${{ vars.SEED_PLAYLIST_IDS }}   # e.g. 37i9dQZF1DX0XUsuxWHRQd,37i9dQZF1DX4dyzvuaRJ0n
+      SEED_ARTIST_IDS:   ${{ vars.SEED_ARTIST_IDS }}     # e.g. 4YRxDV8wJFPHPTeXepOstw,1tqhsYv8yBBdwANFNzHtcr
+      SEED_TRACK_IDS:    ${{ vars.SEED_TRACK_IDS }}      # e.g. 6habFhsOp2NvshLv26DqMb,7hQJA50XrCWABAu5v6QZ4i
+
+      # -------- Defaults; workflow_dispatch inputs override these via step env below --------
+      N_TRACKS_DEFAULT: "50"
+      FAMILIAR_RATIO_DEFAULT: "0.6"
+      CARRY_FRAC_DEFAULT: "0.2"
+      TEMPO_MIN_DEFAULT: "105"
+      TEMPO_MAX_DEFAULT: "132"
+      ENERGY_MIN_DEFAULT: "0.65"
+      ENERGY_MAX_DEFAULT: "0.85"
 
     steps:
-      - name: Check out repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Set up Python
@@ -69,54 +95,110 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
-
       - name: Install dependencies
         run: |
+          set -e
           if [ -f requirements.txt ]; then
             pip install -r requirements.txt
           else
-            pip install spotipy python-dateutil pytz requests tenacity
+            pip install spotipy requests python-dateutil pytz
           fi
+
+      - name: Prepare runtime env (combine inputs with defaults)
+        id: prep
+        run: |
+          # Combine workflow inputs (if provided) with defaults for the script.
+          echo "N_TRACKS=${{ github.event.inputs.n_tracks || env.N_TRACKS_DEFAULT }}" >> $GITHUB_ENV
+          echo "FAMILIAR_RATIO=${{ github.event.inputs.familiar_ratio || env.FAMILIAR_RATIO_DEFAULT }}" >> $GITHUB_ENV
+          echo "CARRY_FRAC=${{ github.event.inputs.carry_frac || env.CARRY_FRAC_DEFAULT }}" >> $GITHUB_ENV
+          echo "TEMPO_MIN=${{ github.event.inputs.tempo_min || env.TEMPO_MIN_DEFAULT }}" >> $GITHUB_ENV
+          echo "TEMPO_MAX=${{ github.event.inputs.tempo_max || env.TEMPO_MAX_DEFAULT }}" >> $GITHUB_ENV
+          echo "ENERGY_MIN=${{ github.event.inputs.energy_min || env.ENERGY_MIN_DEFAULT }}" >> $GITHUB_ENV
+          echo "ENERGY_MAX=${{ github.event.inputs.energy_max || env.ENERGY_MAX_DEFAULT }}" >> $GITHUB_ENV
+
+          # Hard fail early if required secrets are missing
+          REQUIRED=(SPOTIFY_CLIENT_ID SPOTIFY_CLIENT_SECRET SPOTIFY_REFRESH_TOKEN PLAYLIST_ID)
+          for k in "${REQUIRED[@]}"; do
+            v="${!k}"
+            if [ -z "$v" ]; then
+              echo "::error title=Missing secret::$k is not set."
+              exit 1
+            fi
+          done
 
       - name: Run refresh.py
+        id: run_script
         env:
-          # pass inputs in a simple way the script can read (string booleans are fine)
-          DRY_RUN: ${{ env.INPUT_DRY_RUN }}
-          FORCE_PROFILE: ${{ env.INPUT_FORCE_PROFILE }}
-          N_TRACKS: ${{ env.INPUT_N_TRACKS }}
+          # pass the merged values we wrote into $GITHUB_ENV
+          N_TRACKS: ${{ env.N_TRACKS }}
+          FAMILIAR_RATIO: ${{ env.FAMILIAR_RATIO }}
+          CARRY_FRAC: ${{ env.CARRY_FRAC }}
+          TEMPO_MIN: ${{ env.TEMPO_MIN }}
+          TEMPO_MAX: ${{ env.TEMPO_MAX }}
+          ENERGY_MIN: ${{ env.ENERGY_MIN }}
+          ENERGY_MAX: ${{ env.ENERGY_MAX }}
         run: |
           set -e
-          echo "Starting refresh at $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
-          python refresh.py
-          echo "Finished refresh at $(date -u +"%Y-%m-%dT%H:%M:%SZ")"
+          echo "Starting refresh at $(date -u +'%Y-%m-%dT%H:%M:%SZ')" | tee run.log
 
-      - name: Attach report to job summary (if present)
-        if: always()
-        run: |
-          if [ -f report.md ]; then
-            echo "### Refresh Report" >> $GITHUB_STEP_SUMMARY
-            cat report.md >> $GITHUB_STEP_SUMMARY
+          # Show effective config (mask secrets)
+          {
+            echo "PLAYLIST_ID=${PLAYLIST_ID}"
+            echo "COUNTRY_MARKET=${COUNTRY_MARKET}"
+            echo "TIMEZONE=${TIMEZONE}"
+            echo "N_TRACKS=${N_TRACKS}"
+            echo "FAMILIAR_RATIO=${FAMILIAR_RATIO}"
+            echo "CARRY_FRAC=${CARRY_FRAC}"
+            echo "TEMPO_RANGE=${TEMPO_MIN}-${TEMPO_MAX}"
+            echo "ENERGY_RANGE=${ENERGY_MIN}-${ENERGY_MAX}"
+            echo "SEED_PLAYLIST_IDS=${SEED_PLAYLIST_IDS}"
+            echo "SEED_ARTIST_IDS=${SEED_ARTIST_IDS}"
+            echo "SEED_TRACK_IDS=${SEED_TRACK_IDS}"
+            echo "GH_GIST_ID=${GH_GIST_ID}"
+          } | tee -a run.log
+
+          # Run the playlist builder
+          python refresh.py 2>&1 | tee -a run.log
+
+          # Capture optional report files if the script created them
+          if [ -f last_run_report.md ]; then
+            echo "report_path=last_run_report.md" >> $GITHUB_OUTPUT
           fi
-          if [ -f run_log.jsonl ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "<details><summary>Recent run_log.jsonl (tail)</summary>" >> $GITHUB_STEP_SUMMARY
-            tail -n 200 run_log.jsonl >> $GITHUB_STEP_SUMMARY || true
-            echo "</details>" >> $GITHUB_STEP_SUMMARY
+          if [ -f novelty_vault.json ]; then
+            echo "vault_path=novelty_vault.json" >> $GITHUB_OUTPUT
+          fi
+          if [ -f diff.json ]; then
+            echo "diff_path=diff.json" >> $GITHUB_OUTPUT
           fi
 
-      - name: Upload artifacts (report & logs)
+      - name: Upload run log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: refresh-artifacts-${{ github.run_id }}
-          path: |
-            report.md
-            run_log.jsonl
-          if-no-files-found: ignore
+          name: run-log
+          path: run.log
+          retention-days: 14
+
+      - name: Upload report
+        if: always() && steps.run_script.outputs.report_path
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-report
+          path: ${{ steps.run_script.outputs.report_path }}
+          retention-days: 14
+
+      - name: Upload novelty vault snapshot
+        if: always() && steps.run_script.outputs.vault_path
+        uses: actions/upload-artifact@v4
+        with:
+          name: novelty-vault
+          path: ${{ steps.run_script.outputs.vault_path }}
+          retention-days: 14
+
+      - name: Upload diff snapshot
+        if: always() && steps.run_script.outputs.diff_path
+        uses: actions/upload-artifact@v4
+        with:
+          name: run-diff
+          path: ${{ steps.run_script.outputs.diff_path }}
+          retention-days: 14
