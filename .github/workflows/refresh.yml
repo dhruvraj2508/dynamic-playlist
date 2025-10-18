@@ -43,6 +43,9 @@ jobs:
       SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
       SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
       PLAYLIST_ID: ${{ secrets.PLAYLIST_ID }}
+      N_TRACKS: ${{ vars.N_TRACKS }}
+      CARRY_FRACTION: ${{ vars.CARRY_FRACTION }}
+
 
       # --- Optional repository "Variables" (Settings → Secrets and variables → Actions → Variables) ---
       # If not set, your refresh.py should fall back to sane defaults.
